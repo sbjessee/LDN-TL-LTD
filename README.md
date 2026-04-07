@@ -12,7 +12,7 @@ There is also a [Discord server](https://discord.gg/x8np6Hhxwk).
 * [The classes and functions in this package](https://ldn.readthedocs.io)
 
 ### Usage Instructions
-This package requires a Linux system with Python 3.8 or later. Your wireless hardware must also be able to receive and transmit action frames in monitor mode.
+This package requires a Linux system with Python 3.12 or later. Your wireless hardware must also be able to receive and transmit action frames in monitor mode.
 
 Because LDN operates at the data link layer, it requires low-level access to your WLAN hardware. This package requires at least `CAP_NET_ADMIN` privileges. The easiest way to get these privileges is running your scripts as root: `sudo -E python3 script.py`.
 
