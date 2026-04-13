@@ -809,7 +809,7 @@ class DataFrame:
         # without clearing the protected bit?
         if stream.peek(3) == b"\xAA\xAA\x03":
             self.protected = False
-
+        
         if self.protected:
             nonce = stream.u16()
             extra = stream.u16()
@@ -1164,8 +1164,8 @@ class Monitor(Interface):
                 frame = self._parse_frame(radiotap.data)
                 if frame is not None:
                     return frame
-            except Exception:
-                logger.debug("Ignoring invalid frame")
+            except Exception as e:
+                logger.debug(f"Ignoring invalid frame: {e}")
     
     async def send_frame(self, frame: FrameType) -> None:
         """Sends an IEEE 802.11 through the underlying interface."""

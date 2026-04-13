@@ -77,6 +77,9 @@ SECURITY_MODE_SYSTEM_DEBUG = 3 # No advertisement or data frames are encrypted
 CHALLENGE_KEY = bytes.fromhex(
     "f84b487fb37251c263bf11609036589266af70ca79b44c93c7370c5769c0f602"
 )
+CHALLENGE_KEY_DEV = bytes.fromhex(
+    "5a0fbfb5b5c5a2733439401b3d46938343f5d2f494224a7c007b61eaacbc1f20"
+)
 
 
 ChannelBands = {
@@ -126,11 +129,13 @@ class KeyDerivation:
 
     _override_advertise_key: bytes | None
     _override_data_key: bytes | None
+    _override_challenge_key: bytes | None
 
     def __init__(
         self, keys: dict[str, bytes], protocol: int, *,
         override_advertise_key: bytes | None = None,
-        override_data_key: bytes | None = None
+        override_data_key: bytes | None = None,
+        override_challenge_key: bytes | None = None
     ):
         """
         Initializes key derivation with the given encryption keys and protocol
@@ -142,6 +147,7 @@ class KeyDerivation:
 
         self._override_advertise_key = override_advertise_key
         self._override_data_key = override_data_key
+        self._override_challenge_key = override_challenge_key
     
     def _decrypt_key(self, key: bytes, kek: bytes) -> bytes:
         """Decrypts a key with AES-ECB."""
@@ -192,6 +198,13 @@ class KeyDerivation:
         
         source = bytes.fromhex("191884743e24c77d87c69e4207d0c438")
         return self._derive_key(data, source)
+    
+    def challenge_key(self, dev: bool) -> bytes:
+        """Returns the HMAC key for the authentication challenge."""
+        if self._override_challenge_key:
+            return self._override_challenge_key
+        
+        return CHALLENGE_KEY_DEV if dev else CHALLENGE_KEY
 
 
 @dataclass
@@ -585,7 +598,7 @@ class ChallengeRequest:
     params1: list[int] = field(default_factory=list)
     params2: list[int] = field(default_factory=list)
     
-    def encode(self) -> bytes:
+    def encode(self, key: bytes) -> bytes:
         stream = streams.StreamOut("<")
         stream.u8(0) # Always 0
         stream.u8(0) # Always 0
@@ -609,7 +622,7 @@ class ChallengeRequest:
         
         body = stream.get()
         
-        mac = hmac.digest(CHALLENGE_KEY, body, "sha256")
+        mac = hmac.digest(key, body, "sha256")
         
         stream = streams.StreamOut("<")
         stream.u32(0)
@@ -619,7 +632,7 @@ class ChallengeRequest:
         
         return stream.get()
     
-    def decode(self, data: bytes) -> None:
+    def decode(self, data: bytes, key: bytes) -> None:
         if len(data) != 0x300:
             raise ValueError("Challenge request has wrong size")
         
@@ -628,8 +641,8 @@ class ChallengeRequest:
         mac = stream.read(32)
         stream.pad(12)
         body = stream.read(0x2D0)
-        
-        if mac != hmac.digest(CHALLENGE_KEY, body, "sha256"):
+
+        if mac != hmac.digest(key, body, "sha256"):
             raise ValueError("Challenge request has wrong HMAC")
         
         stream = streams.StreamIn(body, "<")
@@ -660,7 +673,7 @@ class ChallengeResponse:
     unk: bytes = bytes(16)
     unk_host: bytes = bytes(16)
     
-    def encode(self) -> bytes:
+    def encode(self, key: bytes) -> bytes:
         stream = streams.StreamOut("<")
         stream.u8(0) # Always 0
         stream.u8(0) # Always 0
@@ -675,7 +688,7 @@ class ChallengeResponse:
         
         body = stream.get()
     
-        mac = hmac.digest(CHALLENGE_KEY, body, "sha256")
+        mac = hmac.digest(key, body, "sha256")
         
         stream = streams.StreamOut("<")
         stream.u32(0)
@@ -684,7 +697,7 @@ class ChallengeResponse:
         stream.write(body)
         return stream.get()
     
-    def decode(self, data: bytes) -> None:
+    def decode(self, data: bytes, key: bytes) -> None:
         if len(data) != 0x100:
             raise ValueError("Challenge response has wrong size")
         
@@ -694,7 +707,7 @@ class ChallengeResponse:
         stream.pad(12)
         body = stream.read(0xD0)
         
-        if mac != hmac.digest(CHALLENGE_KEY, body, "sha256"):
+        if mac != hmac.digest(key, body, "sha256"):
             raise ValueError("Challenge response has wrong HMAC")
         
         stream = streams.StreamIn(body, "<")
@@ -1040,9 +1053,11 @@ class ConnectNetworkParam:
     client_random: bytes | None = None
 
     keys: dict[str, bytes] = field(default_factory=dict)
+    dev: bool = False
 
     override_data_key: bytes | None = None
     override_advertise_key: bytes | None = None
+    override_challenge_key: bytes | None = None
 
     def check(self) -> None:
         if self.network.address == MACAddress():
@@ -1089,9 +1104,11 @@ class CreateNetworkParam:
     protocol: int = 1
     
     keys: dict[str, bytes] = field(default_factory=dict)
+    dev: bool = False
 
     override_data_key: bytes | None = None
     override_advertise_key: bytes | None = None
+    override_challenge_key: bytes | None = None
 
     def check(self):
         if self.max_participants > 8:
@@ -1344,7 +1361,9 @@ class STANetwork:
             challenge.token = self._network.challenge
             challenge.nonce = random.randint(0, 0xFFFFFFFFFFFFFFFF)
             challenge.device_id = self._param.device_id
-            request.challenge = challenge.encode()
+            request.challenge = challenge.encode(
+                self._key_derivation.challenge_key(self._param.dev)
+            )
         
         network_id = NetworkId()
         network_id.local_communication_id = self._network.local_communication_id
@@ -1652,10 +1671,12 @@ class APNetwork:
         self, challenge: bytes
     ) -> bytes | None:
         if not self._enable_challenge: return b""
+
+        challenge_key = self._key_derivation.challenge_key(self._param.dev)
         
         request = ChallengeRequest()
         try:
-            request.decode(challenge)
+            request.decode(challenge, challenge_key)
         except Exception:
             logger.warning("Failed to parse authentication challenge")
             return None
@@ -1670,7 +1691,7 @@ class APNetwork:
         response.device_id = request.device_id
         response.device_id_host = self._device_id
         response.unk = request.unk
-        return response.encode()
+        return response.encode(challenge_key)
     
     def _update_nonce(self) -> None:
         self._advert_nonce = (self._advert_nonce + 1) & 0xFFFFFFFF
@@ -1908,7 +1929,8 @@ async def connect(param: ConnectNetworkParam) -> AsyncIterator[STANetwork]:
     key_derivation = KeyDerivation(
         param.keys, network.protocol,
         override_advertise_key=param.override_advertise_key,
-        override_data_key=param.override_data_key
+        override_data_key=param.override_data_key,
+        override_challenge_key=param.override_challenge_key
     )
     
     wlan_key = None
@@ -1941,7 +1963,8 @@ async def create_network(param: CreateNetworkParam) -> AsyncIterator[APNetwork]:
     key_derivation = KeyDerivation(
         param.keys, param.protocol,
         override_advertise_key=param.override_advertise_key,
-        override_data_key=param.override_data_key
+        override_data_key=param.override_data_key,
+        override_challenge_key=param.override_challenge_key
     )
 
     wlan_key = None
