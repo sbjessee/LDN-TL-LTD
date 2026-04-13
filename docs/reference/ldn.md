@@ -144,12 +144,16 @@ Implements the local wireless protocol used by the Nintendo Switch.
 <span class="docs">Must be 16 bytes. This is used during authentication. If `None`, a random value is generated automatically.</span>
 
 `keys: dict[str, bytes]`<br>
-<span class="docs">The keys that are loaded from `prod.keys`. These can be loaded from a file with the `load_keys` function.</span>
+<span class="docs">The keys that are loaded from `prod.keys`. These can be loaded from a file with the `load_keys` function.</span><br>
+`dev: bool = False`<br>
+<span class="docs">If enabled, a different key is used for the local concurrency check.</span>
 
 `override_advertise_key: bytes | None = None`<br>
 <span class="docs">Overrides the key that is used to decrypt the advertisement frames. This is normally not required, but can be useful while researching new protocol versions.</span><br>
 `override_data_key: bytes | None = None`<br>
-<span class="docs">Overrides the key that is used to encrypt data frames. This is normally not required, but can be useful while researching new protocol versions.</span>
+<span class="docs">Overrides the key that is used to encrypt data frames. This is normally not required, but can be useful while researching new protocol versions.</span><br>
+`override_challenge_key: bytes | None = None`<br>
+<span class="docs">Overrides the HMAC key that is used for the local concurrency check. This is normally not required.</span>
 
 ## CreateNetworkParam
 <code>**def \_\_init__**()</code><br>
@@ -209,12 +213,16 @@ Implements the local wireless protocol used by the Nintendo Switch.
 <span class="docs">The protocol to use, must be 1 (NX) or 3.</span>
 
 `keys: dict[str, bytes]`<br>
-<span class="docs">Encryption keys loaded from `prod.keys`.</span>
+<span class="docs">Encryption keys loaded from `prod.keys`.</span><br>
+`dev: bool = False`<br>
+<span class="docs">If enabled, a different key is used for the local concurrency check.</span>
 
 `override_advertise_key: bytes | None = None`<br>
 <span class="docs">Overrides the key that is used to encrypt the advertisement frames. This is normally not required, but can be useful while researching new protocol versions.</span><br>
 `override_data_key: bytes | None = None`<br>
-<span class="docs">Overrides the key that is used to encrypt data frames. This is normally not required, but can be useful while researching new protocol versions.</span>
+<span class="docs">Overrides the key that is used to encrypt data frames. This is normally not required, but can be useful while researching new protocol versions.</span><br>
+`override_challenge_key: bytes | None = None`<br>
+<span class="docs">Overrides the HMAC key that is used for the local concurrency check. This is normally not required.</span>
 
 ## STANetwork
 <code>**def info**() -> [NetworkInfo](#networkinfo)</code><br>
