@@ -772,6 +772,10 @@ class ActionFrame:
         return stream.get()
 
 
+import struct
+from dataclasses import dataclass
+# Assuming MACAddress, MACHeader, streams, AES, and IEEE80211_FTYPE_DATA are imported/defined elsewhere
+
 @dataclass
 class DataFrame:
     target: MACAddress = MACAddress()
@@ -780,11 +784,15 @@ class DataFrame:
 
     fromds: bool = False
     tods: bool = False
-
     protected: bool = False
 
     nonce: int = 0
     keyid: int = 0
+
+    # NEW: Store subtype and QoS data so we can use them in AAD/Nonce calculation
+    subtype: int = 0
+    qos_control: int = 0
+    has_fcs: bool = False # Set this to true to trim the hardware FCS if it was captured by the sniffer
 
     payload: bytes = b""
 
@@ -794,9 +802,10 @@ class DataFrame:
         header = MACHeader()
         header.decode(stream.read(24))
 
-        if header.type != IEEE80211_FTYPE_DATA or header.subtype != 0:
-            raise ValueError("Frame is not a data frame")
+        if header.type != IEEE80211_FTYPE_DATA or header.subtype not in [0, 8]:
+            raise ValueError(f"Frame is not a data frame (type={header.type}, subtype={header.subtype})")
         
+        self.subtype = header.subtype # NEW: Save the subtype
         self.tods = bool(header.flags & 1)
         self.fromds = bool(header.flags & 2)
         self.protected = bool(header.flags & 0x40)
@@ -804,6 +813,10 @@ class DataFrame:
         self.target = header.address1
         self.source = header.address2
         self.bssid = header.address3
+
+        if self.subtype == 8:
+            # NEW: Read and store the QoS control field instead of throwing it away
+            self.qos_control = stream.u16() 
 
         # This is a bit ugly, but apparently the driver may decrypt the frame
         # without clearing the protected bit?
@@ -823,8 +836,12 @@ class DataFrame:
         self.payload = stream.readall()
 
     def encode(self) -> bytes:
+        # Note: If encoding QoS frames, you'll need to write the QoS control 
+        # field back to the stream here before writing the CCMP headers.
         header = MACHeader()
         header.type = IEEE80211_FTYPE_DATA
+        # Add subtype back in if it's QoS
+        header.subtype = self.subtype 
         header.address1 = self.target
         header.address2 = self.source
         header.address3 = self.bssid
@@ -832,6 +849,9 @@ class DataFrame:
         
         stream = streams.StreamOut("<")
         stream.write(header.encode())
+
+        if self.subtype == 8:
+            stream.u16(self.qos_control)
 
         if self.protected:
             extra = 0x2000 | (self.keyid) << 14
@@ -844,12 +864,14 @@ class DataFrame:
 
     def decrypt(self, key: bytes) -> None:
         """Decrypts the frame if it is protected."""
-
         if not self.protected:
             return
         
-        ciphertext = self.payload[:-8]
-        mac = self.payload[-8:]
+        # NEW: Strip the hardware FCS if it was captured by the sniffer
+        working_payload = self.payload[:-4] if self.has_fcs else self.payload
+
+        ciphertext = working_payload[:-8]
+        mac = working_payload[-8:]
         
         aes = AES.new(key, AES.MODE_CCM, nonce=self._nonce(), mac_len=8)
         aes.update(self._aad())
@@ -873,7 +895,10 @@ class DataFrame:
     
     def _nonce(self) -> bytes:
         """Returns the nonce that is used for the AES-CCMP algorithm."""
-        nonce = b"\0" # Priority
+        # NEW: Use the TID (bits 0-3 of QoS control) as the priority byte
+        priority = self.qos_control & 0x0F if self.subtype == 8 else 0
+        
+        nonce = bytes([priority])
         nonce += self.source.encode()
         nonce += struct.pack(">Q", self.nonce)[2:]
         return nonce
@@ -883,6 +908,11 @@ class DataFrame:
         Returns the additional authenticated data for the AES-CCMP algorithm.
         """
         frame_control = IEEE80211_FTYPE_DATA << 2
+        
+        # NEW: Inject Bit 7 (the '8' in Subtype 8) into the AAD Frame Control
+        if self.subtype == 8:
+            frame_control |= (8 << 4)
+
         frame_control |= self.tods << 8
         frame_control |= self.fromds << 9
         frame_control |= self.protected << 14
@@ -891,7 +921,13 @@ class DataFrame:
         aad += self.target.encode()
         aad += self.source.encode()
         aad += self.bssid.encode()
-        aad += bytes(2) # Fragment number
+        aad += bytes(2) # Fragment number / Sequence Control masked
+        
+        # NEW: Append the QoS Control field to the AAD, masked to only include the TID
+        if self.subtype == 8:
+            masked_qos = self.qos_control & 0x000F
+            aad += struct.pack("<H", masked_qos)
+            
         return aad
 
 

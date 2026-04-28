@@ -247,7 +247,7 @@ class ParticipantInfo:
     connected: bool = False
     name: bytes = b""
     app_version: int = 0
-    platform: int = PLATFORM_NX
+    platform: int = PLATFORM_OUNCE
 
 
 @dataclass
@@ -802,6 +802,18 @@ class AuthenticationFrame:
         self.client_random = bytes(16)
         self.payload = AuthenticationRequest()
 
+    def _encrypt_aes_ctr(self, header: bytes, payload: bytes) -> bytes:
+        key = self._key_derivation.derive_authentication_key(self.client_random)
+
+        aes = AES.new(key, AES.MODE_CTR, nonce=header[:12])
+        return aes.encrypt(payload)
+
+    def _decrypt_aes_ctr(self, header: bytes, payload: bytes) -> bytes:
+        key = self._key_derivation.derive_authentication_key(self.client_random)
+
+        aes = AES.new(key, AES.MODE_CTR, nonce=header[:12])
+        return aes.decrypt(payload)
+
     def _encrypt_aes_gcm(
         self, header: bytes, payload: bytes
     ) -> tuple[bytes, bytes]:
@@ -854,6 +866,8 @@ class AuthenticationFrame:
         if self._protocol == 3:
             payload, tag = self._encrypt_aes_gcm(header, payload)
             stream.write(tag)
+        # else:
+        #     payload = self._encrypt_aes_ctr(header, payload)
 
         stream.write(payload)
         return stream.get()
@@ -901,6 +915,8 @@ class AuthenticationFrame:
         data = stream.read(size)
         if format == AUTH_FORMAT_AES_GCM:
             data = self._decrypt_aes_gcm(header, data, tag)
+        # else:
+        #     data = self._decrypt_aes_ctr(header, data)
         
         self.payload.decode(data, self.version)
 
@@ -1314,6 +1330,8 @@ class STANetwork:
         while True:
             event = await self._interface.next_event()
 
+            print(f"Received event of type {type(event)}")
+
             if isinstance(event, wlan.ActionFrameEvent):
                 if event.frame.source != self._network.address:
                     continue # Only process frames from the host
@@ -1323,6 +1341,7 @@ class STANetwork:
                 )
                 try: frame.decode(event.frame.action)
                 except Exception:
+                    print("Failed to parse advertisement frame from host")
                     continue # Skip invalid frames
                 
                 info = NetworkInfo(self._network.protocol)

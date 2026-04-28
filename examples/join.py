@@ -1,6 +1,9 @@
 
 # This script joins a Super Mario Maker 2 network and listens for packets.
 
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import ldn
 import trio
 import socket
@@ -9,8 +12,8 @@ import socket
 LOCAL_COMMUNICATION_ID = 0x010051F0207B2000
 SCENE_ID = 1
 
-PASSWORD = b"LunchPack2DefaultPhrase"
-APPLICATION_VERSION = 6
+PASSWORD = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+APPLICATION_VERSION = 2
 
 NICKNAME = "Hello!"
 
