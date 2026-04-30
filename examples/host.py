@@ -54,6 +54,19 @@ def make_application_data():
     return stream.data
 
 
+async def process_events(network):
+    while True:
+        event = await network.next_event()
+        if event is not None:
+            print("Received event:", type(event).__name__)
+        if isinstance(event, ldn.JoinEvent):
+            participant = event.participant
+            print("%s joined the network (%s / %s)" %(participant.name.decode(), participant.mac_address, participant.ip_address))
+        elif isinstance(event, ldn.LeaveEvent):
+            participant = event.participant
+            print("%s left the network (%s / %s)" %(participant.name.decode(), participant.mac_address, participant.ip_address))
+
+
 async def main():
     print("Creating network.")
     param = ldn.CreateNetworkParam()
@@ -67,15 +80,15 @@ async def main():
     param.password = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     param.channel = 1
     async with ldn.create_network(param) as network:
-        print("Listening for events.")
-        while True:
-            event = await network.next_event()
-            if event is not None:
-                print("Received event:", type(event).__name__)
-            if isinstance(event, ldn.JoinEvent):
-                participant = event.participant
-                print("%s joined the network (%s / %s)" %(participant.name.decode(), participant.mac_address, participant.ip_address))
-            elif isinstance(event, ldn.LeaveEvent):
-                participant = event.participant
-                print("%s left the network (%s / %s)" %(participant.name.decode(), participant.mac_address, participant.ip_address))
-trio.run(main)
+        print("Network running. Press Enter to stop.")
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(process_events, network)
+            await trio.to_thread.run_sync(sys.stdin.readline)
+            nursery.cancel_scope.cancel()
+    print("Network stopped.")
+
+
+try:
+    trio.run(main)
+except KeyboardInterrupt:
+    print("\nNetwork stopped.")
