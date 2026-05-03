@@ -247,7 +247,7 @@ class ParticipantInfo:
     connected: bool = False
     name: bytes = b""
     app_version: int = 0
-    platform: int = PLATFORM_NX
+    platform: int = PLATFORM_OUNCE
 
 
 @dataclass
@@ -802,6 +802,18 @@ class AuthenticationFrame:
         self.client_random = bytes(16)
         self.payload = AuthenticationRequest()
 
+    def _encrypt_aes_ctr(self, header: bytes, payload: bytes) -> bytes:
+        key = self._key_derivation.derive_authentication_key(self.client_random)
+
+        aes = AES.new(key, AES.MODE_CTR, nonce=header[:12])
+        return aes.encrypt(payload)
+
+    def _decrypt_aes_ctr(self, header: bytes, payload: bytes) -> bytes:
+        key = self._key_derivation.derive_authentication_key(self.client_random)
+
+        aes = AES.new(key, AES.MODE_CTR, nonce=header[:12])
+        return aes.decrypt(payload)
+
     def _encrypt_aes_gcm(
         self, header: bytes, payload: bytes
     ) -> tuple[bytes, bytes]:
@@ -854,6 +866,8 @@ class AuthenticationFrame:
         if self._protocol == 3:
             payload, tag = self._encrypt_aes_gcm(header, payload)
             stream.write(tag)
+        # else:
+        #     payload = self._encrypt_aes_ctr(header, payload)
 
         stream.write(payload)
         return stream.get()
@@ -901,6 +915,8 @@ class AuthenticationFrame:
         data = stream.read(size)
         if format == AUTH_FORMAT_AES_GCM:
             data = self._decrypt_aes_gcm(header, data, tag)
+        # else:
+        #     data = self._decrypt_aes_ctr(header, data)
         
         self.payload.decode(data, self.version)
 
@@ -1314,6 +1330,8 @@ class STANetwork:
         while True:
             event = await self._interface.next_event()
 
+            print(f"Received event of type {type(event)}")
+
             if isinstance(event, wlan.ActionFrameEvent):
                 if event.frame.source != self._network.address:
                     continue # Only process frames from the host
@@ -1323,6 +1341,7 @@ class STANetwork:
                 )
                 try: frame.decode(event.frame.action)
                 except Exception:
+                    print("Failed to parse advertisement frame from host")
                     continue # Skip invalid frames
                 
                 info = NetworkInfo(self._network.protocol)
@@ -1605,13 +1624,16 @@ class APNetwork:
     @contextlib.asynccontextmanager
     async def start(self) -> AsyncIterator[None]:
         await self._initialize_network()
-        async with util.create_nursery() as nursery:
-            nursery.start_soon(self._process_events)
-            nursery.start_soon(self._send_advertisements)
-            nursery.start_soon(self._receive_data_frames)
-            nursery.start_soon(self._transmit_data_frames)
-            yield
-            await self._destroy_network()
+        try:
+            async with util.create_nursery() as nursery:
+                nursery.start_soon(self._process_events)
+                nursery.start_soon(self._send_advertisements)
+                nursery.start_soon(self._receive_data_frames)
+                nursery.start_soon(self._transmit_data_frames)
+                yield
+        finally:
+            with trio.CancelScope(shield=True):
+                await self._destroy_network()
     
     def _make_authentication_response(
         self, status: int, version: int, client_random: bytes,
@@ -1701,16 +1723,22 @@ class APNetwork:
         while True:
             event = await self._interface.next_event()
             if isinstance(event, wlan.CustomFrameEvent):
-                response = await self._process_authentication_event(event)
+                response, new_participant = \
+                    await self._process_authentication_event(event)
                 await self._interface.send_custom_frame(
                     event.address, response.encode()
                 )
+                if new_participant is not None:
+                    ## delay sending ARP request by 500ms to give the host time to add the neighbor entry
+                    await self._send_arp_request(new_participant)
+                    await trio.sleep(0.1)
+                    await self._send_arp_request(new_participant)
             elif isinstance(event, wlan.DisassociationEvent):
                 await self._process_disassociation(event.address)
     
     async def _process_authentication_event(
         self, event: wlan.CustomFrameEvent
-    ) -> AuthenticationFrame:
+    ) -> tuple[AuthenticationFrame, ParticipantInfo | None]:
         frame = AuthenticationFrame(self._key_derivation, self._param.protocol)
         try:
             frame.decode(event.data)
@@ -1718,16 +1746,16 @@ class APNetwork:
             logger.warning("Failed to parse authentication request")
             return self._make_authentication_response(
                 AUTH_MALFORMED_REQUEST, self._network.version, bytes(16)
-            )
-        
+            ), None
+
         error = self._check_authentication_request(event.address, frame)
         if error != AUTH_SUCCESS:
             return self._make_authentication_response(
                 error, self._network.version, frame.client_random
-            )
-        
+            ), None
+
         assert isinstance(frame.payload, AuthenticationRequest)
-        
+
         challenge = self._process_authentication_challenge(
             frame.payload.challenge
         )
@@ -1735,20 +1763,20 @@ class APNetwork:
             return self._make_authentication_response(
                 AUTH_CHALLENGE_FAILURE, self._network.version,
                 frame.client_random
-            )
-        
-        await self._register_participant(
+            ), None
+
+        participant = await self._register_participant(
             event.address, frame.payload.username, frame.payload.app_version,
             frame.payload.platform
         )
-        
+
         return self._make_authentication_response(
             AUTH_SUCCESS, self._network.version, frame.client_random, challenge
-        )
+        ), participant
     
     async def _register_participant(
         self, address: MACAddress, name: bytes, app_version: int, platform: int
-    ) -> None:
+    ) -> ParticipantInfo:
         # Allocate an ip address
         for index in range(8):
             if not self._network.participants[index].connected:
@@ -1774,7 +1802,31 @@ class APNetwork:
         )
         
         await self._events.put(JoinEvent(index, participant))
-    
+        return participant
+
+    async def _send_arp_request(self, participant: ParticipantInfo) -> None:
+        host = self._network.participants[0]
+        arp_payload = wlan.build_arp_request(
+            self._interface.address(),
+            host.ip_address,
+            participant.ip_address
+        )
+        snap = wlan.SNAPHeader()
+        snap.protocol = wlan.ETH_P_ARP
+        snap.payload = arp_payload
+
+        frame = wlan.DataFrame()
+        frame.target = wlan.MACAddress("ff:ff:ff:ff:ff:ff")
+        frame.source = self._interface.address()
+        frame.bssid  = participant.mac_address
+        frame.payload = snap.encode()
+        frame.fromds = False
+        frame.tods = False
+        if self._key:
+            self._data_nonce += 1
+            frame.encrypt(self._key, self._data_nonce, 1)
+        await self._monitor.send_frame(frame)
+
     async def _process_disassociation(self, address: MACAddress) -> None:
         for index, participant in enumerate(self._network.participants):
             if participant.connected and participant.mac_address == address:
@@ -1830,8 +1882,8 @@ class APNetwork:
             if isinstance(frame, wlan.DataFrame):
                 try:
                     await self._process_data_frame(frame)
-                except Exception:
-                    pass # Ignore invalid frames
+                except (ValueError, struct.error):
+                    logger.debug("Dropping invalid data frame", exc_info=True)
     
     async def _transmit_data_frames(self) -> None:
         while True:
@@ -1858,20 +1910,36 @@ class APNetwork:
         
         if frame.source not in self._peers:
             return
-        
+
         if frame.target != self._monitor.address() and \
            frame.target != MACAddress("ff:ff:ff:ff:ff:ff"):
             return
-        
+
         snap = wlan.SNAPHeader()
         snap.decode(frame.payload)
-        
+
+        if snap.protocol == wlan.ETH_P_ARP:
+            await self._process_arp_reply(frame.source, snap.payload)
+            return
+
         header = wlan.EthernetFrame()
         header.source = frame.source
         header.target = frame.target
         header.protocol = snap.protocol
         header.payload = snap.payload
         await self._tap.write(header.encode())
+
+    async def _process_arp_reply(
+        self, source_mac: wlan.MACAddress, data: bytes
+    ) -> None:
+        stream = streams.StreamIn(data, ">")
+        stream.pad(6)               # hw type, proto type, addr lens
+        operation = stream.u16()
+        if operation != 2:          # only care about replies
+            return
+        sender_mac = wlan.MACAddress(stream.read(6))
+        sender_ip  = socket.inet_ntoa(stream.read(4))
+        logger.debug("ARP reply: %s is at %s", sender_ip, sender_mac)
     
     async def _send_data_frame(self, data: bytes) -> None:
         # We are simply sending all frames to the broadcast address here.

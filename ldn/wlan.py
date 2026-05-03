@@ -19,6 +19,7 @@ from ldn import streams, util, queue
 import contextlib
 import fcntl
 import netlink
+import os
 import socket
 import string
 import struct
@@ -780,11 +781,14 @@ class DataFrame:
 
     fromds: bool = False
     tods: bool = False
-
     protected: bool = False
 
     nonce: int = 0
     keyid: int = 0
+
+    subtype: int = 0
+    qos_control: int = 0
+    has_fcs: bool = False # Set this to true to trim the hardware FCS if it was captured by the sniffer
 
     payload: bytes = b""
 
@@ -794,9 +798,10 @@ class DataFrame:
         header = MACHeader()
         header.decode(stream.read(24))
 
-        if header.type != IEEE80211_FTYPE_DATA or header.subtype != 0:
-            raise ValueError("Frame is not a data frame")
+        if header.type != IEEE80211_FTYPE_DATA or header.subtype not in [0, 8]:
+            raise ValueError(f"Frame is not a data frame (type={header.type}, subtype={header.subtype})")
         
+        self.subtype = header.subtype
         self.tods = bool(header.flags & 1)
         self.fromds = bool(header.flags & 2)
         self.protected = bool(header.flags & 0x40)
@@ -804,6 +809,9 @@ class DataFrame:
         self.target = header.address1
         self.source = header.address2
         self.bssid = header.address3
+
+        if self.subtype == 8:
+            self.qos_control = stream.u16() 
 
         # This is a bit ugly, but apparently the driver may decrypt the frame
         # without clearing the protected bit?
@@ -825,6 +833,7 @@ class DataFrame:
     def encode(self) -> bytes:
         header = MACHeader()
         header.type = IEEE80211_FTYPE_DATA
+        header.subtype = self.subtype 
         header.address1 = self.target
         header.address2 = self.source
         header.address3 = self.bssid
@@ -832,6 +841,9 @@ class DataFrame:
         
         stream = streams.StreamOut("<")
         stream.write(header.encode())
+
+        if self.subtype == 8:
+            stream.u16(self.qos_control)
 
         if self.protected:
             extra = 0x2000 | (self.keyid) << 14
@@ -844,12 +856,13 @@ class DataFrame:
 
     def decrypt(self, key: bytes) -> None:
         """Decrypts the frame if it is protected."""
-
         if not self.protected:
             return
         
-        ciphertext = self.payload[:-8]
-        mac = self.payload[-8:]
+        working_payload = self.payload[:-4] if self.has_fcs else self.payload
+
+        ciphertext = working_payload[:-8]
+        mac = working_payload[-8:]
         
         aes = AES.new(key, AES.MODE_CCM, nonce=self._nonce(), mac_len=8)
         aes.update(self._aad())
@@ -873,7 +886,9 @@ class DataFrame:
     
     def _nonce(self) -> bytes:
         """Returns the nonce that is used for the AES-CCMP algorithm."""
-        nonce = b"\0" # Priority
+        priority = self.qos_control & 0x0F if self.subtype == 8 else 0
+        
+        nonce = bytes([priority])
         nonce += self.source.encode()
         nonce += struct.pack(">Q", self.nonce)[2:]
         return nonce
@@ -883,6 +898,10 @@ class DataFrame:
         Returns the additional authenticated data for the AES-CCMP algorithm.
         """
         frame_control = IEEE80211_FTYPE_DATA << 2
+        
+        if self.subtype == 8:
+            frame_control |= (8 << 4)
+
         frame_control |= self.tods << 8
         frame_control |= self.fromds << 9
         frame_control |= self.protected << 14
@@ -891,7 +910,12 @@ class DataFrame:
         aad += self.target.encode()
         aad += self.source.encode()
         aad += self.bssid.encode()
-        aad += bytes(2) # Fragment number
+        aad += bytes(2) # Fragment number / Sequence Control masked
+        
+        if self.subtype == 8:
+            masked_qos = self.qos_control & 0x000F
+            aad += struct.pack("<H", masked_qos)
+            
         return aad
 
 
@@ -940,6 +964,23 @@ class EthernetFrame:
         stream.u16(self.protocol)
         stream.write(self.payload)
         return stream.get()
+
+
+def build_arp_request(
+    sender_mac: MACAddress, sender_ip: str, target_ip: str
+) -> bytes:
+    """Builds a raw ARP request packet."""
+    stream = streams.StreamOut(">")
+    stream.u16(1)                       # hardware type: Ethernet
+    stream.u16(0x0800)                  # protocol: IPv4
+    stream.u8(6)                        # hardware address length
+    stream.u8(4)                        # protocol address length
+    stream.u16(1)                       # operation: request
+    stream.write(sender_mac.encode())
+    stream.write(socket.inet_aton(sender_ip))
+    stream.write(bytes(6))              # target hardware address (unknown)
+    stream.write(socket.inet_aton(target_ip))
+    return stream.get()
 
 
 FrameTypes: dict[int, type[FrameType]] = {
@@ -1781,20 +1822,22 @@ class AccessPoint(Interface):
 
 
 class Tap(Interface):
-    _file: trio._file_io.AsyncIOWrapper
+    _fd: int
 
     def __init__(
         self, wlan: nl80211.NL80211, router: route.RouteController, ifname: str,
-        address: MACAddress, file: trio._file_io.AsyncIOWrapper
+        address: MACAddress, fd: int
     ):
         super().__init__(wlan, router, ifname, address=address)
-        self._file = file
-    
+        self._fd = fd
+
     async def write(self, data: bytes) -> None:
-        await self._file.write(data)
-    
+        await trio.lowlevel.wait_writable(self._fd)
+        os.write(self._fd, data)
+
     async def read(self) -> bytes:
-        return await self._file.read(4096)
+        await trio.lowlevel.wait_readable(self._fd)
+        return os.read(self._fd, 4096)
 
 
 class Factory:
@@ -1879,15 +1922,17 @@ class Factory:
     async def create_tap(
         self, ifname: str, address: MACAddress
     ) -> AsyncIterator[Tap]:
-        file = await trio.open_file("/dev/net/tun", "rb+", buffering=0)
-        async with file:
+        fd = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
+        try:
             request = struct.pack("16sH", ifname.encode(), IFF_TAP | IFF_NO_PI)
-            fcntl.ioctl(file.fileno(), TUNSETIFF, request)
+            fcntl.ioctl(fd, TUNSETIFF, request)
 
-            tap = Tap(self._wlan, self._router, ifname, address, file)
+            tap = Tap(self._wlan, self._router, ifname, address, fd)
             await tap.update_link(address)
             await tap.up()
             yield tap
+        finally:
+            os.close(fd)
     
     @contextlib.asynccontextmanager
     async def _create_interface(
