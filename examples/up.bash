@@ -1,5 +1,4 @@
 #!/bin/bash
+# Kill NetworkManager and wpa_supplicant so they don't interfere with LDN.
+# LDN creates its own ldn (AP) and ldn-mon (monitor) interfaces via nl80211.
 airmon-ng check kill
-airmon-ng start wlan0
-iw dev wlan0mon set channel 1  
-ethtool -K wlan0mon rx-fcs off
