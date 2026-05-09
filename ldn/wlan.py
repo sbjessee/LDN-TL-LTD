@@ -1210,9 +1210,16 @@ class Monitor(Interface):
     
     async def send_frame(self, frame: FrameType) -> None:
         """Sends an IEEE 802.11 through the underlying interface."""
+        data = frame.encode()
+        try:
+            header = MACHeader()
+            header.decode(data)
+            if header.address1 != MACAddress("ff:ff:ff:ff:ff:ff"):
+                logger.info("Sending %s to %s", type(frame).__name__, header.address1)
+        except Exception:
+            pass
         async with self._lock:
-            radiotap = RadiotapFrame(frame.encode())
-            await self.send(radiotap)
+            await self.send(RadiotapFrame(data))
     
     def _parse_frame(self, data: bytes) -> FrameType | None:
         """
@@ -1814,6 +1821,15 @@ class AccessPoint(Interface):
     
     async def send_frame(self, data: bytes) -> None:
         """Sends a management frame."""
+        try:
+            header = MACHeader()
+            header.decode(data)
+            if header.address1 != MACAddress("ff:ff:ff:ff:ff:ff"):
+                frame_cls = FrameTypes.get(header.subtype)
+                name = frame_cls.__name__ if frame_cls else f"ManagementFrame(subtype={header.subtype})"
+                logger.info("Sending %s to %s", name, header.address1)
+        except Exception:
+            pass
         attrs = {
             nl80211.NL80211_ATTR_IFINDEX: self.index(),
             nl80211.NL80211_ATTR_FRAME: data

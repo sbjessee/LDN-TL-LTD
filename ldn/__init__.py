@@ -1401,6 +1401,7 @@ class STANetwork:
         
         # Attempt authentication up to three times
         for i in range(3):
+            logger.info("Sending authentication request to %s", self._network.address)
             await self._interface.send_custom_frame(
                 self._network.address, frame.encode()
             )
@@ -1612,6 +1613,7 @@ class APNetwork:
         if participant.connected:
             frame = DisconnectFrame()
             frame.reason = DISCONNECT_STATION_REJECTED_BY_HOST
+            logger.info("Sending disconnect to %s", participant.mac_address)
             await self._interface.send_custom_frame(
                 participant.mac_address, frame.encode()
             )
@@ -1725,12 +1727,12 @@ class APNetwork:
             if isinstance(event, wlan.CustomFrameEvent):
                 response, new_participant = \
                     await self._process_authentication_event(event)
+                logger.info("Sending authentication response to %s", event.address)
                 await self._interface.send_custom_frame(
                     event.address, response.encode()
                 )
                 if new_participant is not None:
                     ## delay sending ARP request by 500ms to give the host time to add the neighbor entry
-                    await self._send_arp_request(new_participant)
                     await trio.sleep(0.1)
                     await self._send_arp_request(new_participant)
             elif isinstance(event, wlan.DisassociationEvent):
@@ -1805,6 +1807,7 @@ class APNetwork:
         return participant
 
     async def _send_arp_request(self, participant: ParticipantInfo) -> None:
+        logger.info("Sending ARP request for %s", participant.ip_address)
         host = self._network.participants[0]
         arp_payload = wlan.build_arp_request(
             self._interface.address(),
@@ -1858,6 +1861,7 @@ class APNetwork:
             if participant.connected:
                 frame = DisconnectFrame()
                 frame.reason = DISCONNECT_NETWORK_DESTROYED
+                logger.info("Sending disconnect to %s", participant.mac_address)
                 await self._interface.send_custom_frame(
                     participant.mac_address, frame.encode()
                 )
