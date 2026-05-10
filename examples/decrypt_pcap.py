@@ -49,6 +49,14 @@ def main():
         "--protocol", type=int, default=1,
         help="LDN protocol version: 1 (pre-20.0.0) or 3 (20.0.0+)"
     )
+    parser.add_argument(
+        "--hide-repeated", action="store_true", default=False,
+        help="Drop repeated beacons and advertisement frames (keep only first of each)"
+    )
+    parser.add_argument(
+        "--decrypt-advertisements", action="store_true", default=False,
+        help="Re-encode advertisement action frames with the payload decrypted (plaintext)"
+    )
     args = parser.parse_args()
 
     keys = ldn.load_keys(args.keys)
@@ -93,28 +101,43 @@ def main():
                     if not seen_beacon:
                         seen_beacon = True
                         writer.write(packet)
-                    # Subsequent beacons are dropped.
+                    elif not args.hide_repeated:
+                        writer.write(packet)
+                    # else: repeated beacon suppressed
 
                 elif header.subtype == wlan.IEEE80211_STYPE_ACTION:
-                    if not seen_advertisement:
+                    is_first = not seen_advertisement
+                    if is_first:
                         seen_advertisement = True
-                        # Parse the action body to derive the data key.
-                        if wlan_key is None:
-                            try:
-                                action = wlan.ActionFrame()
-                                action.decode(frame_data)
-                                adv = ldn.AdvertisementFrame(key_derivation, args.protocol)
-                                adv.decode(action.action)
+
+                    if args.hide_repeated and not is_first:
+                        pass  # suppressed
+                    else:
+                        out_packet = packet
+                        try:
+                            action = wlan.ActionFrame()
+                            action.decode(frame_data)
+                            adv = ldn.AdvertisementFrame(key_derivation, args.protocol)
+                            adv.decode(action.action)
+
+                            if is_first and wlan_key is None:
                                 server_random = adv.payload.server_random
                                 wlan_key = key_derivation.derive_data_key(
                                     server_random, password
                                 )
                                 print(f"Server random:  {server_random.hex()}")
                                 print(f"Data key:       {wlan_key.hex()}")
-                            except Exception as e:
-                                print(f"Warning: could not derive data key: {e}")
-                        writer.write(packet)
-                    # Subsequent advertisement frames are dropped.
+
+                            if args.decrypt_advertisements:
+                                adv.format = ldn.ADVERTISE_FORMAT_PLAIN
+                                action.action = adv.encode()
+                                new_raw = rebuild_radiotap(radiotap, action.encode())
+                                out_packet = RadioTap(new_raw)
+                                out_packet.time = packet.time
+                        except Exception as e:
+                            if is_first:
+                                print(f"Warning: could not parse advertisement: {e}")
+                        writer.write(out_packet)
 
                 else:
                     # Auth, assoc, probe, deauth, etc. — keep all.
@@ -127,9 +150,17 @@ def main():
                     continue
 
                 # Decode the data frame.
+                # has_fcs: hardware appends a 4-byte FCS to captured frames and
+                # signals it via the RADIOTAP_FLAG_FCS bit.  Software-injected
+                # frames (e.g. our own ARP) have no FCS, so we must check the
+                # radiotap flags rather than assuming one is always present.
+                has_fcs = bool(
+                    radiotap.flags is not None and
+                    radiotap.flags & RADIOTAP_FLAG_FCS
+                )
                 try:
                     data_frame = wlan.DataFrame()
-                    data_frame.has_fcs = True
+                    data_frame.has_fcs = has_fcs
                     data_frame.decode(frame_data)
                 except (ValueError, struct.error):
                     writer.write(packet)
@@ -151,9 +182,10 @@ def main():
                         writer.write(packet)
                         continue
                 else:
-                    # Frame was already decrypted by the driver; strip the
-                    # hardware FCS that decode() left in the payload.
-                    data_frame.payload = data_frame.payload[:-4]
+                    # Frame was already decrypted by the driver.  Strip the
+                    # hardware FCS only if the radiotap header says it's there.
+                    if has_fcs:
+                        data_frame.payload = data_frame.payload[:-4]
 
                 # Re-encode the (possibly decrypted) frame and rewrap it.
                 new_raw = rebuild_radiotap(radiotap, data_frame.encode())
