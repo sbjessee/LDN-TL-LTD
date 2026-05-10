@@ -114,13 +114,16 @@ def is_valid_channel(channel: int) -> bool:
     return channel in Channels
 
 
-def encode_elements(elements: dict[int, bytes]) -> bytes:
+def encode_elements(elements: dict[int, bytes | list[bytes]]) -> bytes:
     """Encodes the given information elements (TLVs)."""
     stream = streams.StreamOut("<")
     for id in sorted(elements):
-        stream.u8(id)
-        stream.u8(len(elements[id]))
-        stream.write(elements[id])
+        value = elements[id]
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            stream.u8(id)
+            stream.u8(len(item))
+            stream.write(item)
     return stream.get()
 
 def decode_elements(data: bytes) -> dict[int, bytes]:
@@ -813,9 +816,14 @@ class DataFrame:
         if self.subtype == 8:
             self.qos_control = stream.u16() 
 
-        # This is a bit ugly, but apparently the driver may decrypt the frame
-        # without clearing the protected bit?
-        if stream.peek(3) == b"\xAA\xAA\x03":
+        # The driver may decrypt the frame without clearing the Protected bit.
+        # Case A: CCMP header already stripped — SNAP follows immediately.
+        # Case B: CCMP header (8 bytes) still present but payload is plaintext.
+        ahead = stream.peek(11)
+        if ahead[:3] == b"\xAA\xAA\x03":
+            self.protected = False
+        elif len(ahead) >= 11 and ahead[8:11] == b"\xAA\xAA\x03":
+            stream.read(8)  # skip CCMP header
             self.protected = False
         
         if self.protected:
@@ -981,6 +989,72 @@ def build_arp_request(
     stream.write(bytes(6))              # target hardware address (unknown)
     stream.write(socket.inet_aton(target_ip))
     return stream.get()
+
+
+def _ip_checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b'\x00'
+    total = sum((data[i] << 8) + data[i + 1] for i in range(0, len(data), 2))
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return ~total & 0xFFFF
+
+
+def build_udp_packet(
+    src_ip: str, dst_ip: str, src_port: int, dst_port: int, payload: bytes,
+    ttl: int = 64, ip_id: int = 0
+) -> bytes:
+    """Builds a raw IPv4/UDP packet."""
+    src = socket.inet_aton(src_ip)
+    dst = socket.inet_aton(dst_ip)
+
+    udp_len = 8 + len(payload)
+    pseudo = struct.pack("!4s4sBBH", src, dst, 0, 17, udp_len)
+    udp_no_cksum = struct.pack("!HHHH", src_port, dst_port, udp_len, 0)
+    udp_cksum = _ip_checksum(pseudo + udp_no_cksum + payload)
+    udp = struct.pack("!HHHH", src_port, dst_port, udp_len, udp_cksum)
+
+    ip_len = 20 + udp_len
+    ip_no_cksum = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, ip_len, ip_id, 0, ttl, 17, 0, src, dst
+    )
+    ip_cksum = _ip_checksum(ip_no_cksum)
+    ip = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, ip_len, ip_id, 0, ttl, 17, ip_cksum, src, dst
+    )
+    return ip + udp + payload
+
+
+def build_tcp_packet(
+    src_ip: str, dst_ip: str, src_port: int, dst_port: int,
+    payload: bytes, seq: int = 0, ack_num: int = 0, flags: int = 0x02,
+    window: int = 65535, ttl: int = 64, ip_id: int = 0
+) -> bytes:
+    """Builds a raw IPv4/TCP packet. Common flags: SYN=0x02, ACK=0x10, RST=0x04."""
+    src = socket.inet_aton(src_ip)
+    dst = socket.inet_aton(dst_ip)
+
+    tcp_len = 20 + len(payload)
+    pseudo = struct.pack("!4s4sBBH", src, dst, 0, 6, tcp_len)
+    tcp_no_cksum = struct.pack(
+        "!HHIIBBHHH", src_port, dst_port, seq, ack_num,
+        0x50, flags, window, 0, 0
+    ) + payload
+    tcp_cksum = _ip_checksum(pseudo + tcp_no_cksum)
+    tcp = struct.pack(
+        "!HHIIBBHHH", src_port, dst_port, seq, ack_num,
+        0x50, flags, window, tcp_cksum, 0
+    ) + payload
+
+    ip_len = 20 + tcp_len
+    ip_no_cksum = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, ip_len, ip_id, 0x4000, ttl, 6, 0, src, dst
+    )
+    ip_cksum = _ip_checksum(ip_no_cksum)
+    ip = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, ip_len, ip_id, 0x4000, ttl, 6, ip_cksum, src, dst
+    )
+    return ip + tcp
 
 
 FrameTypes: dict[int, type[FrameType]] = {
@@ -1172,6 +1246,7 @@ class Monitor(Interface):
         method must be called exactly once before radiotap frames can be
         received.
         """
+        self._socket.setsockopt(263, 23, 1)  # SOL_PACKET, PACKET_IGNORE_OUTGOING
         await self.up()
         await self._socket.bind((self.name(), 0))
     
@@ -1585,14 +1660,28 @@ class AccessPoint(Interface):
         response = AssociationResponse()
         response.source = self.address()
         response.target = address
-        response.capability_information = 0x411
+        response.capability_information = 0x0611  # ESS + Privacy + ShortSlot + QoS
         response.status_code = WLAN_STATUS_SUCCESS
         response.aid = aid | 0xC000
+        # WMM Parameter Element: OUI 00:50:F2, type 2, subtype 1, version 1,
+        # QoS info 0, reserved 0, then default EDCA params for BE/BK/VI/VO.
+        wmm_ie = bytes.fromhex(
+            "0050f2020101"  # OUI 00:50:F2, type 2, subtype 1, version 1
+            "0000"          # QoS info, reserved
+            "03a40000"      # AC_BE
+            "27a40000"      # AC_BK
+            "42435e00"      # AC_VI
+            "62322f00"      # AC_VO
+        )
         response.elements = {
-            WLAN_EID_SUPP_RATES: rates.encode()
+            WLAN_EID_SUPP_RATES: rates.encode(),
+            WLAN_EID_VENDOR_SPECIFIC: [
+                bytes.fromhex("001018") + bytes([0x02]) + bytes.fromhex("00001c0000"),
+                wmm_ie,
+            ],
         }
         return response.encode()
-    
+
     def _create_association_error(
         self, address: MACAddress, error: int
     ) -> bytes:
@@ -1608,6 +1697,22 @@ class AccessPoint(Interface):
         response.aid = 0
         return response.encode()
     
+    async def _send_epigram_frame(self, target: MACAddress) -> None:
+        # Vendor-specific Broadcom/Epigram (00:90:4C) frame sent by real Nintendo
+        # Switch hosts immediately after association response.
+        header = MACHeader()
+        header.type = IEEE80211_FTYPE_MGMT
+        header.subtype = IEEE80211_STYPE_ACTION
+        header.address1 = target
+        header.address2 = self.address()
+        header.address3 = self.address()
+        body = bytes.fromhex(
+            "7f00904c"                        # category=0x7f, OUI=00:90:4c
+            "dd1afeedfacedeadbeef010000000a"  # vendor IE + magic + fields
+            "00000000000000000000000000"       # padding
+        )
+        await self.send_frame(header.encode() + body)
+
     def _parse_management_frame(self, data: bytes) -> FrameType:
         header = MACHeader()
         header.decode(data)
@@ -1724,6 +1829,7 @@ class AccessPoint(Interface):
             if ssid == self._ssid.encode():
                 response = await self._process_association_request(frame)
                 await self.send_frame(response)
+                await self._send_epigram_frame(frame.source)
         elif isinstance(frame, (DisassociationFrame, DeauthenticationFrame)):
             await self._process_disassociation(frame)
     
@@ -1791,7 +1897,18 @@ class AccessPoint(Interface):
                 }
             }
             await self._wlan.request(nl80211.NL80211_CMD_NEW_KEY, attrs)
-        
+
+        flags = (
+            (1 << nl80211.NL80211_STA_FLAG_AUTHORIZED) |
+            (1 << nl80211.NL80211_STA_FLAG_WME)
+        )
+        attrs = {
+            nl80211.NL80211_ATTR_IFINDEX: self.index(),
+            nl80211.NL80211_ATTR_MAC: frame.source.encode(),
+            nl80211.NL80211_ATTR_STA_FLAGS2: struct.pack("II", flags, flags)
+        }
+        await self._wlan.request(nl80211.NL80211_CMD_SET_STATION, attrs)
+
         await self._events.put(AssociationEvent(frame.source))
         return self._create_association_response(frame.source, aid)
     
