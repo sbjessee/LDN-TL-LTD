@@ -1607,7 +1607,7 @@ class AccessPoint(Interface):
         frame = BeaconFrame()
         frame.source = self.address()
         frame.beacon_interval = 100
-        frame.capability_information = 0x511
+        frame.capability_information = 0x0711  # ESS + Privacy + SpectrumMgmt + ShortSlot + QoS
         return frame.encode()
     
     def _create_beacon_tail(self) -> bytes:
