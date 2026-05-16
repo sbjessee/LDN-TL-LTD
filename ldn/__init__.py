@@ -1586,6 +1586,7 @@ class APNetwork:
 
         self._peers = []
         self._udp_channels: dict[MACAddress, trio.MemorySendChannel] = {}
+        self._arp_channels: dict[MACAddress, trio.MemorySendChannel] = {}
 
         self._events = queue.create()
     
@@ -1730,13 +1731,21 @@ class APNetwork:
                     response, new_participant = \
                         await self._process_authentication_event(event)
                     if new_participant is not None:
+                        mac = new_participant.mac_address
+                        if mac not in self._arp_channels:
+                            send_ch, recv_ch = trio.open_memory_channel(8)
+                            self._udp_channels[mac] = send_ch
+                            self._arp_channels[mac] = send_ch
+                            start_handshake = True
+                        else:
+                            start_handshake = False
                         await self._send_advertisement()
                     logger.info("Sending authentication response to %s", event.address)
                     await self._interface.send_custom_frame(
                         event.address, response.encode()
                     )
-                    if new_participant is not None:
-                        nursery.start_soon(self._do_udp_handshake, new_participant)
+                    if new_participant is not None and start_handshake:
+                        nursery.start_soon(self._do_udp_handshake, new_participant, send_ch, recv_ch)
                 elif isinstance(event, wlan.DisassociationEvent):
                     ch = self._udp_channels.get(event.address)
                     if ch is not None:
@@ -1827,8 +1836,7 @@ class APNetwork:
         snap.payload = arp_payload
 
         frame = wlan.DataFrame()
-        frame.subtype = 8
-        frame.qos_control = 0
+        frame.subtype = 0
         frame.target = wlan.MACAddress("ff:ff:ff:ff:ff:ff")
         frame.source = self._interface.address()
         frame.bssid  = self._interface.address()
@@ -1882,28 +1890,58 @@ class APNetwork:
             src_port, dst_port, data, seq, ack_num, flags, window
         ))
 
-    async def _do_udp_handshake(self, participant: ParticipantInfo) -> None:
-        await trio.sleep(1.0)
-        await self._send_arp_request(participant)
-        await trio.sleep(1.0)
-        send_channel, recv_channel = trio.open_memory_channel(8)
-        self._udp_channels[participant.mac_address] = send_channel
+    async def _do_udp_handshake(
+        self, participant: ParticipantInfo,
+        send_channel: trio.MemorySendChannel,
+        recv_channel: trio.MemoryReceiveChannel
+    ) -> None:
         ip_id = random.randint(1, 0xFFFF)
         try:
+            # Wait for console's ARP broadcast before starting UDP.
+            logger.info("Waiting for ARP from %s", participant.mac_address)
             while True:
-                logger.info("Sending UDP handshake to %s", participant.mac_address)
-                await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
-                ip_id = (ip_id + 1) & 0xFFFF
                 signal = await recv_channel.receive()
-                if signal == 'echo':
-                    logger.info("UDP handshake complete with %s", participant.mac_address)
-                    return
+                if signal == 'arp':
+                    break
                 elif signal == 'cancel':
                     logger.info("UDP handshake cancelled for %s", participant.mac_address)
                     return
-                # signal == 'icmp' — wait before resending
-                await trio.sleep(0.2)
+
+            got_echo = False
+            for attempt in range(1, 3):
+                logger.info("Sending UDP handshake to %s (attempt %d/2)", participant.mac_address, attempt)
+                await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
+                ip_id = (ip_id + 1) & 0xFFFF
+
+                while True:
+                    signal = await recv_channel.receive()
+                    if signal == 'echo':
+                        got_echo = True
+                        break
+                    elif signal == 'icmp':
+                        break
+                    elif signal == 'cancel':
+                        logger.info("UDP handshake cancelled for %s", participant.mac_address)
+                        return
+
+                if got_echo:
+                    break
+
+            if not got_echo:
+                logger.info("Retries exhausted, waiting for UDP echo from %s", participant.mac_address)
+                while True:
+                    signal = await recv_channel.receive()
+                    if signal == 'echo':
+                        break
+                    elif signal == 'cancel':
+                        logger.info("UDP handshake cancelled for %s", participant.mac_address)
+                        return
+
+            # Send one final packet after receiving the echo.
+            logger.info("UDP handshake complete with %s", participant.mac_address)
+            # await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
         finally:
+            self._arp_channels.pop(participant.mac_address, None)
             self._udp_channels.pop(participant.mac_address, None)
             await send_channel.aclose()
             await recv_channel.aclose()
@@ -1935,7 +1973,7 @@ class APNetwork:
             dst_port = struct.unpack_from("!H", ip_payload, 2)[0]
             payload = ip_payload[8:]
             if (src_port == 5001 and dst_port == 5001
-                    and payload == b'\x01\x00\x00\x00'):
+                    and payload.startswith(b'\x01\x00\x00\x00')):
                 try:
                     self._udp_channels[source].send_nowait('echo')
                 except (trio.WouldBlock, trio.ClosedResourceError):
@@ -1956,6 +1994,8 @@ class APNetwork:
         participant.connected = False
         self._network.num_participants -= 1
 
+        self._network.application_data = self._param.application_data
+        self._seq_num = 1
         self._update_nonce()
         
         await self._interface.remove_neighbor(
@@ -2000,7 +2040,7 @@ class APNetwork:
             if isinstance(frame, wlan.DataFrame):
                 try:
                     await self._process_data_frame(frame)
-                except (ValueError, struct.error):
+                except (ValueError, struct.error, streams.ParseError):
                     level = logging.WARNING if isinstance(frame, wlan.DataFrame) and frame.source in self._peers else logging.DEBUG
                     logger.log(level, "Dropping invalid data frame", exc_info=True)
     
@@ -2058,19 +2098,44 @@ class APNetwork:
         self, source_mac: wlan.MACAddress, data: bytes
     ) -> None:
         stream = streams.StreamIn(data, ">")
-        stream.pad(6)               # hw type, proto type, addr lens
+        stream.skip(6)              # hw type, proto type, addr lens
         operation = stream.u16()
-        if operation != 2:          # only care about replies
-            return
         sender_mac = wlan.MACAddress(stream.read(6))
         sender_ip  = socket.inet_ntoa(stream.read(4))
-        logger.debug("ARP reply: %s is at %s", sender_ip, sender_mac)
+        target_mac = wlan.MACAddress(stream.read(6))
+        target_ip  = socket.inet_ntoa(stream.read(4))
+
+        if operation == 2 and target_mac == self._interface.address():
+            # Directed ARP reply to our request — trigger UDP handshake
+            logger.info("ARP reply from %s (%s)", sender_ip, sender_mac)
+            ch = self._arp_channels.get(source_mac)
+            if ch is not None:
+                try:
+                    ch.send_nowait('arp')
+                except (trio.WouldBlock, trio.ClosedResourceError):
+                    pass
+        elif sender_ip == target_ip:
+            # Gratuitous ARP (op==1 or op==2, sender announces its own IP)
+            logger.info("Gratuitous ARP from %s (%s)", sender_ip, sender_mac)
+            participant = next(
+                (p for p in self._network.participants
+                 if p.connected and p.mac_address == source_mac),
+                None
+            )
+            if participant is not None:
+                # Two advertisement updates matching real console behaviour:
+                # each step increments the nonce and doubles the first app data byte.
+                for _ in range(2):
+                    app = bytearray(self._network.application_data)
+                    app[0] = (app[0] << 1) & 0xFF
+                    self.set_application_data(bytes(app))
+                    await self._send_advertisement()
+                await self._send_arp_request(participant)
     
     async def _send_data_frame(self, data: bytes) -> None:
         # We are simply sending all frames to the broadcast address here.
         frame = wlan.DataFrame()
-        frame.subtype = 8
-        frame.qos_control = 0
+        frame.subtype = 0
         frame.target = MACAddress("ff:ff:ff:ff:ff:ff")
         frame.source = self._monitor.address()
         frame.bssid = self._monitor.address()

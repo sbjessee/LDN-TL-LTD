@@ -23,6 +23,7 @@ import os
 import socket
 import string
 import struct
+import subprocess
 import trio
 import typing
 
@@ -45,6 +46,8 @@ ETH_P_ALL = 3
 ETH_P_IP = 0x800
 ETH_P_ARP = 0x806
 ETH_P_OUI = 0x88B7
+
+RADIOTAP_FLAG_FCS = 0x10
 
 
 IEEE80211_FTYPE_MGMT = 0
@@ -1248,6 +1251,10 @@ class Monitor(Interface):
         """
         self._socket.setsockopt(263, 23, 1)  # SOL_PACKET, PACKET_IGNORE_OUTGOING
         await self.up()
+        subprocess.run(
+            ["ethtool", "-K", self.name(), "rx-fcs", "off"],
+            capture_output=True
+        )
         await self._socket.bind((self.name(), 0))
     
     async def recv(self) -> RadiotapFrame:
@@ -1276,8 +1283,12 @@ class Monitor(Interface):
         """
         while True:
             radiotap = await self.recv()
+            has_fcs = bool(
+                radiotap.flags is not None and
+                radiotap.flags & RADIOTAP_FLAG_FCS
+            )
             try:
-                frame = self._parse_frame(radiotap.data)
+                frame = self._parse_frame(radiotap.data, has_fcs)
                 if frame is not None:
                     return frame
             except Exception as e:
@@ -1296,7 +1307,7 @@ class Monitor(Interface):
         async with self._lock:
             await self.send(RadiotapFrame(data))
     
-    def _parse_frame(self, data: bytes) -> FrameType | None:
+    def _parse_frame(self, data: bytes, has_fcs: bool = False) -> FrameType | None:
         """
         Parses an IEEE 802.11 frame and returns it. Raises an exception if the
         frame cannot be parsed.
@@ -1309,13 +1320,14 @@ class Monitor(Interface):
         if bssid != MACAddress("ff:ff:ff:ff:ff:ff") and \
            self._filter is not None and bssid != self._filter:
             return None
-        
+
         if header.type == IEEE80211_FTYPE_MGMT:
             frame = FrameTypes[header.subtype]()
             frame.decode(data)
             return frame
         elif header.type == IEEE80211_FTYPE_DATA:
             frame = DataFrame()
+            frame.has_fcs = has_fcs
             frame.decode(data)
             return frame
         else:

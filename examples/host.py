@@ -82,6 +82,8 @@ async def main():
     param.app_version = 2
     param.password = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     param.channel = 1
+    param.phyname = "phy1"
+    param.phyname_monitor = "phy1"
     async with ldn.create_network(param) as network:
         print("Network running. Press Enter to stop.")
         async with trio.open_nursery() as nursery:
