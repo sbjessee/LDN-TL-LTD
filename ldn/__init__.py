@@ -19,12 +19,10 @@ import copy
 import hashlib
 import hmac
 import os
-import pathlib
 import random
 import secrets
 import socket
 import struct
-import time
 import trio
 import typing
 
@@ -1178,9 +1176,41 @@ class AcceptPolicyChanged:
     old: int
     new: int
 
+class TCPStream:
+    def __init__(self, recv_channel: trio.MemoryReceiveChannel, send_fn) -> None:
+        self._recv = recv_channel
+        self._send_fn = send_fn
+
+    async def send(self, data: bytes) -> None:
+        await self._send_fn(data)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await self._recv.receive()
+        except trio.EndOfChannel:
+            raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        await self._recv.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        await self.aclose()
+
+
+@dataclass
+class TCPStreamEvent:
+    participant: ParticipantInfo
+    stream: TCPStream
+
 
 type EventType = DisconnectEvent | JoinEvent | LeaveEvent | \
-    ApplicationDataChanged | AcceptPolicyChanged
+    ApplicationDataChanged | AcceptPolicyChanged | TCPStreamEvent
 
 
 class Scanner:
@@ -2000,68 +2030,58 @@ class APNetwork:
                         return
                 logger.info("Incoming TCP handshake complete with %s", participant.mac_address)
                 our_seq_data = (in_isn + 1) & 0xFFFFFFFF
-                tcp_buffer = bytearray()
-                buffering = False
-                ooo: list[tuple[int, bytes, bool]] = []  # out-of-order: (seq, payload, psh)
+                ooo: list[tuple[int, bytes]] = []  # out-of-order: (seq, payload)
                 expected_seq = (client_seq + 1) & 0xFFFFFFFF
-                logger.info("Listening for TCP data from %s", participant.mac_address)
+                data_send, data_recv = trio.open_memory_channel(32)
 
-                def _tcp_seq_lt(a: int, b: int) -> bool:
+                async def _tcp_app_send(data: bytes) -> None:
+                    nonlocal our_seq_data
+                    await self._send_tcp(participant, 5002, client_src_port, data,
+                                         seq=our_seq_data,
+                                         ack_num=expected_seq,
+                                         flags=0x18)  # PSH+ACK
+                    our_seq_data = (our_seq_data + len(data)) & 0xFFFFFFFF
+
+                await self._events.put(TCPStreamEvent(participant, TCPStream(data_recv, _tcp_app_send)))
+
+                async def _deliver(payload: bytes) -> None:
+                    nonlocal expected_seq
+                    expected_seq = (expected_seq + len(payload)) & 0xFFFFFFFF
+                    await data_send.send(bytes(payload))
+
+                async def _drain_ooo() -> None:
+                    ooo.sort(key=lambda x: x[0])
+                    while ooo and ooo[0][0] == expected_seq:
+                        await _deliver(ooo.pop(0)[1])
+
+                def _seq_lt(a: int, b: int) -> bool:
                     return ((b - a) & 0xFFFFFFFF) < 0x80000000
 
-                def _drain_ooo(buf: bytearray, buffering_: bool) -> tuple[bytearray, bool, int, bytes | None]:
-                    nonlocal expected_seq
-                    dump: bytes | None = None
-                    while ooo:
-                        ooo.sort(key=lambda x: x[0])
-                        seg_seq, seg_pay, seg_psh = ooo[0]
-                        if seg_seq != expected_seq:
+                logger.info("Streaming TCP data from %s", participant.mac_address)
+                try:
+                    while True:
+                        signal = await in_recv.receive()
+                        if isinstance(signal, tuple) and signal[0] == 'data':
+                            _, pkt_seq, pkt_payload, _psh = signal
+                            new_ack = (pkt_seq + len(pkt_payload)) & 0xFFFFFFFF
+                            await self._send_tcp(participant, 5002, client_src_port, b'',
+                                                 seq=our_seq_data, ack_num=new_ack, flags=0x10)
+                            if pkt_seq == expected_seq:
+                                await _deliver(pkt_payload)
+                                await _drain_ooo()
+                            elif _seq_lt(expected_seq, pkt_seq):
+                                ooo.append((pkt_seq, pkt_payload))
+                        elif isinstance(signal, tuple) and signal[0] == 'fin':
+                            _, pkt_seq, fin_data_len = signal
+                            new_ack = (pkt_seq + fin_data_len + 1) & 0xFFFFFFFF
+                            await self._send_tcp(participant, 5002, client_src_port, b'',
+                                                 seq=our_seq_data, ack_num=new_ack, flags=0x10)
                             break
-                        ooo.pop(0)
-                        expected_seq = (expected_seq + len(seg_pay)) & 0xFFFFFFFF
-                        if seg_psh:
-                            if buffering_ and buf:
-                                dump = bytes(buf)
-                            buf = bytearray(seg_pay)
-                            buffering_ = True
-                        elif buffering_:
-                            buf.extend(seg_pay)
-                    return buf, buffering_, expected_seq, dump
-
-                while True:
-                    signal = await in_recv.receive()
-                    if isinstance(signal, tuple) and signal[0] == 'data':
-                        _, pkt_seq, pkt_payload, psh = signal
-                        new_ack = (pkt_seq + len(pkt_payload)) & 0xFFFFFFFF
-                        await self._send_tcp(participant, 5002, client_src_port, b'',
-                                             seq=our_seq_data, ack_num=new_ack, flags=0x10)
-                        if pkt_seq == expected_seq:
-                            expected_seq = (expected_seq + len(pkt_payload)) & 0xFFFFFFFF
-                            if psh:
-                                if buffering and tcp_buffer:
-                                    dump_path = pathlib.Path(f"tcp_dump_{int(time.time())}.bin")
-                                    dump_path.write_bytes(tcp_buffer)
-                                    logger.info("TCP push (%d bytes) → %s", len(tcp_buffer), dump_path)
-                                tcp_buffer = bytearray(pkt_payload)
-                                buffering = True
-                            elif buffering:
-                                tcp_buffer.extend(pkt_payload)
-                            tcp_buffer, buffering, expected_seq, dump = _drain_ooo(tcp_buffer, buffering)
-                            if dump is not None:
-                                dump_path = pathlib.Path(f"tcp_dump_{int(time.time())}.bin")
-                                dump_path.write_bytes(dump)
-                                logger.info("TCP push (%d bytes) → %s", len(dump), dump_path)
-                        elif _tcp_seq_lt(expected_seq, pkt_seq):
-                            ooo.append((pkt_seq, pkt_payload, psh))
-                    elif isinstance(signal, tuple) and signal[0] == 'fin':
-                        _, pkt_seq, fin_data_len = signal
-                        new_ack = (pkt_seq + fin_data_len + 1) & 0xFFFFFFFF
-                        await self._send_tcp(participant, 5002, client_src_port, b'',
-                                             seq=our_seq_data, ack_num=new_ack, flags=0x10)
-                        break
-                    elif signal == 'cancel':
-                        logger.info("TCP data loop cancelled for %s", participant.mac_address)
-                        return
+                        elif signal == 'cancel':
+                            logger.info("TCP data loop cancelled for %s", participant.mac_address)
+                            return
+                finally:
+                    await data_send.aclose()
             finally:
                 self._tcp_channels.pop(participant.mac_address, None)
                 await in_send.aclose()

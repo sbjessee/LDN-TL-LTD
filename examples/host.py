@@ -57,7 +57,38 @@ def make_application_data():
     return stream.data
 
 
-async def process_events(network):
+async def handle_tcp_stream(participant, stream):
+    import pathlib, time
+    buf = bytearray()
+    async with stream:
+        async for chunk in stream:
+            buf.extend(chunk)
+            # Process all complete CLTP SUPPLY messages buffered so far
+            while True:
+                if not buf.startswith(b'CLTP SUPPLY '):
+                    break
+                null_idx = buf.find(0)
+                if null_idx == -1:
+                    break  # header not yet complete
+                try:
+                    header = buf[:null_idx].decode('ascii')
+                    hex_str = header.split(' ')[2]   # "0x26b4"
+                    total_len = int(hex_str, 16)
+                    data_len = total_len - 1
+                except (ValueError, IndexError):
+                    break
+                msg_end = null_idx + 1 + data_len
+                if len(buf) < msg_end:
+                    break  # payload not yet complete
+                payload = bytes(buf[null_idx + 1:msg_end])
+                buf = buf[msg_end:]
+                out = pathlib.Path(f"cltp_{int(time.time())}.bin")
+                out.write_bytes(payload)
+                print(f"CLTP SUPPLY {data_len} bytes from {participant.mac_address} → {out}")
+                await stream.send(b'CLTP ACCEPT\x00')
+
+
+async def process_events(network, nursery):
     while True:
         event = await network.next_event()
         if event is not None:
@@ -68,6 +99,8 @@ async def process_events(network):
         elif isinstance(event, ldn.LeaveEvent):
             participant = event.participant
             print("%s left the network (%s / %s)" %(participant.name.decode(), participant.mac_address, participant.ip_address))
+        elif isinstance(event, ldn.TCPStreamEvent):
+            nursery.start_soon(handle_tcp_stream, event.participant, event.stream)
 
 
 async def main():
@@ -87,7 +120,7 @@ async def main():
     async with ldn.create_network(param) as network:
         print("Network running. Press Enter to stop.")
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(process_events, network)
+            nursery.start_soon(process_events, network, nursery)
             await trio.to_thread.run_sync(sys.stdin.readline)
             nursery.cancel_scope.cancel()
     print("Network stopped.")
