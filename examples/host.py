@@ -9,6 +9,7 @@ import trio
 import struct
 import random
 import logging
+import pathlib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 
@@ -57,53 +58,104 @@ def make_application_data():
     return stream.data
 
 
-async def handle_tcp_stream(participant, stream):
-    import pathlib, time
+CLTP_CHUNK_SIZE = 536
+CLTP_SEND_DELAY = 3.0
+
+
+def _parse_cltp_supply(buf: bytearray) -> tuple[int, int] | None:
+    """Return (null_idx, data_len) if a complete CLTP SUPPLY header is present, else None."""
+    if not buf.startswith(b'CLTP SUPPLY '):
+        return None
+    null_idx = buf.find(0)
+    if null_idx == -1:
+        return None
+    try:
+        hex_str = buf[12:null_idx].decode('ascii')  # skip "CLTP SUPPLY "
+        total_len = int(hex_str, 16)
+        return null_idx, total_len - 1
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+async def handle_tcp_stream(participant, stream, filepath, join_time):
+    import time as time_mod
     buf = bytearray()
+
     async with stream:
+        if filepath is not None:
+            remaining = CLTP_SEND_DELAY - (trio.current_time() - join_time)
+            if remaining > 0:
+                await trio.sleep(remaining)
+
+            data = pathlib.Path(filepath).read_bytes()
+            header = f'CLTP SUPPLY 0x{len(data) + 1:x}\x00'.encode('ascii')
+            await stream.send(header, push=True)
+            await stream.wait_all_acked()
+
+            chunks = [data[i:i + CLTP_CHUNK_SIZE] for i in range(0, len(data), CLTP_CHUNK_SIZE)]
+            for idx, chunk in enumerate(chunks):
+                await stream.wait_window(3)
+                is_last = idx == len(chunks) - 1
+                await stream.send(chunk + b'\x00' if is_last else chunk, push=is_last)
+            await stream.wait_all_acked()
+
+            resp_buf = bytearray()
+            with trio.move_on_after(5):
+                while b'\x00' not in resp_buf:
+                    resp_buf.extend(await stream.receive())
+            null_idx = resp_buf.find(0)
+            if null_idx != -1:
+                response = resp_buf[:null_idx].decode('ascii', errors='replace')
+                print(f"CLTP response from {participant.mac_address}: {response!r}")
+                buf = bytearray(resp_buf[null_idx + 1:])
+            else:
+                print(f"No CLTP response received from {participant.mac_address}")
+                buf = bytearray(resp_buf)
+
         async for chunk in stream:
             buf.extend(chunk)
-            # Process all complete CLTP SUPPLY messages buffered so far
             while True:
-                if not buf.startswith(b'CLTP SUPPLY '):
+                parsed = _parse_cltp_supply(buf)
+                if parsed is None:
                     break
-                null_idx = buf.find(0)
-                if null_idx == -1:
-                    break  # header not yet complete
-                try:
-                    header = buf[:null_idx].decode('ascii')
-                    hex_str = header.split(' ')[2]   # "0x26b4"
-                    total_len = int(hex_str, 16)
-                    data_len = total_len - 1
-                except (ValueError, IndexError):
-                    break
+                null_idx, data_len = parsed
                 msg_end = null_idx + 1 + data_len
                 if len(buf) < msg_end:
-                    break  # payload not yet complete
+                    break
                 payload = bytes(buf[null_idx + 1:msg_end])
                 buf = buf[msg_end:]
-                out = pathlib.Path(f"cltp_{int(time.time())}.bin")
+                if len(payload) != data_len:
+                    print(f"WARNING: CLTP size mismatch from {participant.mac_address}: advertised {data_len}, received {len(payload)}")
+                out = pathlib.Path(f"cltp_{int(time_mod.time())}.bin")
                 out.write_bytes(payload)
                 print(f"CLTP SUPPLY {data_len} bytes from {participant.mac_address} → {out}")
                 await stream.send(b'CLTP ACCEPT\x00')
 
 
-async def process_events(network, nursery):
+async def process_events(network, nursery, filepath):
+    join_times: dict[str, float] = {}
     while True:
         event = await network.next_event()
         if event is not None:
             print("Received event:", type(event).__name__)
         if isinstance(event, ldn.JoinEvent):
             participant = event.participant
+            join_times[str(participant.mac_address)] = trio.current_time()
             print("%s joined the network (%s / %s)" %(participant.name.decode(), participant.mac_address, participant.ip_address))
         elif isinstance(event, ldn.LeaveEvent):
             participant = event.participant
+            join_times.pop(str(participant.mac_address), None)
             print("%s left the network (%s / %s)" %(participant.name.decode(), participant.mac_address, participant.ip_address))
         elif isinstance(event, ldn.TCPStreamEvent):
-            nursery.start_soon(handle_tcp_stream, event.participant, event.stream)
+            join_time = join_times.get(str(event.participant.mac_address), trio.current_time())
+            nursery.start_soon(handle_tcp_stream, event.participant, event.stream, filepath, join_time)
 
 
 async def main():
+    filepath = sys.argv[1] if len(sys.argv) > 1 else None
+    if filepath is not None:
+        print(f"Will send {filepath!r} to participant after {CLTP_SEND_DELAY:.0f}s.")
+
     print("Creating network.")
     param = ldn.CreateNetworkParam()
     param.keys = ldn.load_keys("~/.switch/prod.keys")
@@ -120,7 +172,7 @@ async def main():
     async with ldn.create_network(param) as network:
         print("Network running. Press Enter to stop.")
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(process_events, network, nursery)
+            nursery.start_soon(process_events, network, nursery, filepath)
             await trio.to_thread.run_sync(sys.stdin.readline)
             nursery.cancel_scope.cancel()
     print("Network stopped.")

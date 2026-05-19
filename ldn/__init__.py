@@ -247,7 +247,7 @@ class ParticipantInfo:
     connected: bool = False
     name: bytes = b""
     app_version: int = 0
-    platform: int = PLATFORM_OUNCE
+    platform: int = PLATFORM_NX
 
 
 @dataclass
@@ -1111,7 +1111,6 @@ class CreateNetworkParam:
     channel: int | None = None
     server_random: bytes | None = None
     password: bytes = b""
-
     version: int = 4
     enable_challenge: bool = True
     device_id: int = \
@@ -1177,12 +1176,37 @@ class AcceptPolicyChanged:
     new: int
 
 class TCPStream:
-    def __init__(self, recv_channel: trio.MemoryReceiveChannel, send_fn) -> None:
+    def __init__(self, recv_channel: trio.MemoryReceiveChannel, send_fn,
+                 ack_channel: trio.MemoryReceiveChannel) -> None:
         self._recv = recv_channel
         self._send_fn = send_fn
+        self._ack_recv = ack_channel
+        self._bytes_sent: int = 0
+        self._bytes_acked: int = 0
+        self._segments: list[int] = []  # cumulative byte end of each unACKed send
 
-    async def send(self, data: bytes) -> None:
-        await self._send_fn(data)
+    def _process_ack(self, relative_ack: int) -> None:
+        self._bytes_acked = max(self._bytes_acked, relative_ack)
+        while self._segments and self._segments[0] <= self._bytes_acked:
+            self._segments.pop(0)
+
+    async def wait_window(self, max_unacked: int) -> None:
+        """Block until fewer than max_unacked segments are in flight."""
+        while len(self._segments) >= max_unacked:
+            self._process_ack(await self._ack_recv.receive())
+
+    async def wait_all_acked(self) -> None:
+        """Block until all sent segments have been ACKed."""
+        while self._segments:
+            self._process_ack(await self._ack_recv.receive())
+
+    async def receive(self) -> bytes:
+        return await self._recv.receive()
+
+    async def send(self, data: bytes, push: bool = True) -> None:
+        await self._send_fn(data, push)
+        self._bytes_sent += len(data)
+        self._segments.append(self._bytes_sent)
 
     def __aiter__(self):
         return self
@@ -1917,12 +1941,13 @@ class APNetwork:
     async def _send_tcp(
         self, participant: ParticipantInfo, src_port: int, dst_port: int,
         data: bytes, seq: int = 0, ack_num: int = 0, flags: int = 0x02,
-        window: int = 65535
+        window: int = 65535, ip_id: int = 0
     ) -> None:
         host = self._network.participants[0]
         await self._send_ip_frame(participant, wlan.build_tcp_packet(
             host.ip_address, participant.ip_address,
-            src_port, dst_port, data, seq, ack_num, flags, window
+            src_port, dst_port, data, seq, ack_num, flags, window,
+            ip_id=ip_id
         ))
 
     async def _do_udp_handshake(
@@ -1932,8 +1957,16 @@ class APNetwork:
     ) -> None:
         ip_id = random.randint(1, 0xFFFF)
         try:
-            # Wait for console's ARP broadcast before starting UDP.
-            logger.info("Waiting for ARP from %s", participant.mac_address)
+            await trio.sleep(0.05)
+            for _ in range(2):
+                app = bytearray(self._network.application_data)
+                app[0] = (app[0] << 1) & 0xFF
+                self.set_application_data(bytes(app))
+                await self._send_advertisement()
+            logger.info("Sending ARP request to %s", participant.mac_address)
+            await self._send_arp_request(participant)
+
+            logger.info("Waiting for ARP reply from %s", participant.mac_address)
             while True:
                 signal = await recv_channel.receive()
                 if signal == 'arp':
@@ -1943,7 +1976,7 @@ class APNetwork:
                     return
 
             got_echo = False
-            for attempt in range(1, 3):
+            for attempt in range(1, 5):
                 logger.info("Sending UDP handshake to %s (attempt %d/2)", participant.mac_address, attempt)
                 await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
                 ip_id = (ip_id + 1) & 0xFFFF
@@ -1952,6 +1985,9 @@ class APNetwork:
                     signal = await recv_channel.receive()
                     if signal == 'echo':
                         got_echo = True
+                        # await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
+                        # ip_id = (ip_id + 1) & 0xFFFF
+                        logger.info("UDP handshake complete with %s", participant.mac_address)
                         break
                     elif signal == 'icmp':
                         break
@@ -1975,16 +2011,19 @@ class APNetwork:
             # Send one final packet after receiving the echo.
             logger.info("UDP handshake complete with %s", participant.mac_address)
             await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
+            ip_id = (ip_id + 1) & 0xFFFF
 
             # TCP 3-way handshake
-            tcp_src_port = 49150 + random.randint(0, 9)
+            tcp_src_port = 49200 + random.randint(0, 9)
             tcp_isn = random.randint(0, 0xFFFFFFFF)
             tcp_send, tcp_recv = trio.open_memory_channel(4)
             self._tcp_channels[participant.mac_address] = tcp_send
             try:
                 logger.info("Sending TCP SYN to %s", participant.mac_address)
                 await self._send_tcp(participant, tcp_src_port, 5002, b'',
-                                     seq=tcp_isn, ack_num=0, flags=0x02)
+                                     seq=tcp_isn, ack_num=0, flags=0x02,
+                                     ip_id=ip_id)
+                ip_id = (ip_id + 1) & 0xFFFF
                 while True:
                     signal = await tcp_recv.receive()
                     if isinstance(signal, tuple) and signal[0] == 'syn_ack':
@@ -1996,7 +2035,8 @@ class APNetwork:
                 await self._send_tcp(participant, tcp_src_port, 5002, b'',
                                      seq=(tcp_isn + 1) & 0xFFFFFFFF,
                                      ack_num=(server_seq + 1) & 0xFFFFFFFF,
-                                     flags=0x10)
+                                     flags=0x10, ip_id=ip_id)
+                ip_id = (ip_id + 1) & 0xFFFF
                 logger.info("TCP handshake complete with %s", participant.mac_address)
             finally:
                 self._tcp_channels.pop(participant.mac_address, None)
@@ -2020,7 +2060,8 @@ class APNetwork:
                 await self._send_tcp(participant, 5002, client_src_port, b'',
                                      seq=in_isn,
                                      ack_num=(client_seq + 1) & 0xFFFFFFFF,
-                                     flags=0x12)
+                                     flags=0x12, ip_id=ip_id)
+                ip_id = (ip_id + 1) & 0xFFFF
                 while True:
                     signal = await in_recv.receive()
                     if isinstance(signal, tuple) and signal[0] == 'ack':
@@ -2030,19 +2071,31 @@ class APNetwork:
                         return
                 logger.info("Incoming TCP handshake complete with %s", participant.mac_address)
                 our_seq_data = (in_isn + 1) & 0xFFFFFFFF
+                initial_our_seq = our_seq_data
                 ooo: list[tuple[int, bytes]] = []  # out-of-order: (seq, payload)
                 expected_seq = (client_seq + 1) & 0xFFFFFFFF
                 data_send, data_recv = trio.open_memory_channel(32)
+                ack_send, ack_recv = trio.open_memory_channel(16)
 
-                async def _tcp_app_send(data: bytes) -> None:
-                    nonlocal our_seq_data
+                async def _tcp_app_send(data: bytes, push: bool = True) -> None:
+                    nonlocal our_seq_data, ip_id
                     await self._send_tcp(participant, 5002, client_src_port, data,
                                          seq=our_seq_data,
                                          ack_num=expected_seq,
-                                         flags=0x18)  # PSH+ACK
+                                         flags=0x18 if push else 0x10,
+                                         ip_id=ip_id)
+                    ip_id = (ip_id + 1) & 0xFFFF
                     our_seq_data = (our_seq_data + len(data)) & 0xFFFFFFFF
 
-                await self._events.put(TCPStreamEvent(participant, TCPStream(data_recv, _tcp_app_send)))
+                def _forward_ack(remote_ack_num: int) -> None:
+                    rel = (remote_ack_num - initial_our_seq) & 0xFFFFFFFF
+                    try:
+                        ack_send.send_nowait(rel)
+                    except (trio.WouldBlock, trio.ClosedResourceError):
+                        pass
+
+                await self._events.put(TCPStreamEvent(
+                    participant, TCPStream(data_recv, _tcp_app_send, ack_recv)))
 
                 async def _deliver(payload: bytes) -> None:
                     nonlocal expected_seq
@@ -2062,26 +2115,37 @@ class APNetwork:
                     while True:
                         signal = await in_recv.receive()
                         if isinstance(signal, tuple) and signal[0] == 'data':
-                            _, pkt_seq, pkt_payload, _psh = signal
+                            _, pkt_seq, pkt_payload, _psh, remote_ack = signal
+                            _forward_ack(remote_ack)
                             new_ack = (pkt_seq + len(pkt_payload)) & 0xFFFFFFFF
                             await self._send_tcp(participant, 5002, client_src_port, b'',
-                                                 seq=our_seq_data, ack_num=new_ack, flags=0x10)
+                                                 seq=our_seq_data, ack_num=new_ack, flags=0x10,
+                                                 ip_id=ip_id)
+                            ip_id = (ip_id + 1) & 0xFFFF
                             if pkt_seq == expected_seq:
                                 await _deliver(pkt_payload)
                                 await _drain_ooo()
                             elif _seq_lt(expected_seq, pkt_seq):
-                                ooo.append((pkt_seq, pkt_payload))
+                                if not any(s == pkt_seq for s, _ in ooo):
+                                    ooo.append((pkt_seq, pkt_payload))
+                        elif isinstance(signal, tuple) and signal[0] == 'ack':
+                            _, remote_ack = signal
+                            _forward_ack(remote_ack)
                         elif isinstance(signal, tuple) and signal[0] == 'fin':
-                            _, pkt_seq, fin_data_len = signal
+                            _, pkt_seq, fin_data_len, remote_ack = signal
+                            _forward_ack(remote_ack)
                             new_ack = (pkt_seq + fin_data_len + 1) & 0xFFFFFFFF
                             await self._send_tcp(participant, 5002, client_src_port, b'',
-                                                 seq=our_seq_data, ack_num=new_ack, flags=0x10)
+                                                 seq=our_seq_data, ack_num=new_ack, flags=0x10,
+                                                 ip_id=ip_id)
+                            ip_id = (ip_id + 1) & 0xFFFF
                             break
                         elif signal == 'cancel':
                             logger.info("TCP data loop cancelled for %s", participant.mac_address)
                             return
                 finally:
                     await data_send.aclose()
+                    await ack_send.aclose()
             finally:
                 self._tcp_channels.pop(participant.mac_address, None)
                 await in_send.aclose()
@@ -2146,6 +2210,7 @@ class APNetwork:
         data_len = max(0, ip_total - ihl - tcp_hlen)
 
         payload = bytes(tcp[tcp_hlen:tcp_hlen + data_len]) if data_len > 0 else b''
+        ack_num = struct.unpack_from("!I", tcp, 8)[0]
 
         signal = None
         if (flags & 0x12) == 0x12:       # SYN-ACK
@@ -2153,10 +2218,10 @@ class APNetwork:
         elif (flags & 0x12) == 0x02:     # pure SYN
             signal = ('syn', seq, src_port)
         elif flags & 0x01:               # FIN
-            signal = ('fin', seq, data_len)
+            signal = ('fin', seq, data_len, ack_num)
         elif (flags & 0x10) and not (flags & 0x02):  # ACK (no SYN)
             psh = bool(flags & 0x08)
-            signal = ('data', seq, payload, psh) if data_len > 0 else ('ack',)
+            signal = ('data', seq, payload, psh, ack_num) if data_len > 0 else ('ack', ack_num)
         if signal is not None:
             try:
                 self._tcp_channels[source].send_nowait(signal)
@@ -2291,7 +2356,6 @@ class APNetwork:
         target_ip  = socket.inet_ntoa(stream.read(4))
 
         if operation == 2 and target_mac == self._interface.address():
-            # Directed ARP reply to our request — trigger UDP handshake
             logger.info("ARP reply from %s (%s)", sender_ip, sender_mac)
             ch = self._arp_channels.get(source_mac)
             if ch is not None:
@@ -2299,23 +2363,6 @@ class APNetwork:
                     ch.send_nowait('arp')
                 except (trio.WouldBlock, trio.ClosedResourceError):
                     pass
-        elif sender_ip == target_ip:
-            # Gratuitous ARP (op==1 or op==2, sender announces its own IP)
-            logger.info("Gratuitous ARP from %s (%s)", sender_ip, sender_mac)
-            participant = next(
-                (p for p in self._network.participants
-                 if p.connected and p.mac_address == source_mac),
-                None
-            )
-            if participant is not None:
-                # Two advertisement updates matching real console behaviour:
-                # each step increments the nonce and doubles the first app data byte.
-                for _ in range(2):
-                    app = bytearray(self._network.application_data)
-                    app[0] = (app[0] << 1) & 0xFF
-                    self.set_application_data(bytes(app))
-                    await self._send_advertisement()
-                await self._send_arp_request(participant)
     
     async def _send_data_frame(self, data: bytes) -> None:
         # We are simply sending all frames to the broadcast address here.

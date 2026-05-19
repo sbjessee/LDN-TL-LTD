@@ -1031,23 +1031,25 @@ def build_udp_packet(
 def build_tcp_packet(
     src_ip: str, dst_ip: str, src_port: int, dst_port: int,
     payload: bytes, seq: int = 0, ack_num: int = 0, flags: int = 0x02,
-    window: int = 65535, ttl: int = 64, ip_id: int = 0
+    window: int = 65535, ttl: int = 64, ip_id: int = 0, options: bytes = b''
 ) -> bytes:
     """Builds a raw IPv4/TCP packet. Common flags: SYN=0x02, ACK=0x10, RST=0x04."""
     src = socket.inet_aton(src_ip)
     dst = socket.inet_aton(dst_ip)
 
-    tcp_len = 20 + len(payload)
+    opt_len = len(options)
+    data_offset = (20 + opt_len) // 4
+    tcp_len = 20 + opt_len + len(payload)
     pseudo = struct.pack("!4s4sBBH", src, dst, 0, 6, tcp_len)
     tcp_no_cksum = struct.pack(
         "!HHIIBBHHH", src_port, dst_port, seq, ack_num,
-        0x50, flags, window, 0, 0
-    ) + payload
+        data_offset << 4, flags, window, 0, 0
+    ) + options + payload
     tcp_cksum = _ip_checksum(pseudo + tcp_no_cksum)
     tcp = struct.pack(
         "!HHIIBBHHH", src_port, dst_port, seq, ack_num,
-        0x50, flags, window, tcp_cksum, 0
-    ) + payload
+        data_offset << 4, flags, window, tcp_cksum, 0
+    ) + options + payload
 
     ip_len = 20 + tcp_len
     ip_no_cksum = struct.pack(
