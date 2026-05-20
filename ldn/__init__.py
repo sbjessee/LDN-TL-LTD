@@ -1925,7 +1925,7 @@ class APNetwork:
         frame.tods = False
         if self._key:
             self._data_nonce += 1
-            frame.encrypt(self._key, self._data_nonce, 1)
+            frame.encrypt(self._key, self._data_nonce, 0)
         await self._monitor.send_frame(frame)
 
     async def _send_udp(
@@ -1941,13 +1941,13 @@ class APNetwork:
     async def _send_tcp(
         self, participant: ParticipantInfo, src_port: int, dst_port: int,
         data: bytes, seq: int = 0, ack_num: int = 0, flags: int = 0x02,
-        window: int = 65535, ip_id: int = 0
+        window: int = 65535, ip_id: int = 0, options: bytes = b''
     ) -> None:
         host = self._network.participants[0]
         await self._send_ip_frame(participant, wlan.build_tcp_packet(
             host.ip_address, participant.ip_address,
             src_port, dst_port, data, seq, ack_num, flags, window,
-            ip_id=ip_id
+            ip_id=ip_id, options=options
         ))
 
     async def _do_udp_handshake(
@@ -1966,50 +1966,36 @@ class APNetwork:
             logger.info("Sending ARP request to %s", participant.mac_address)
             await self._send_arp_request(participant)
 
+            # Wait for ARP reply. Some clients (Switch 2) skip ARP reply and
+            # start sending UDP immediately — treat early 'echo' as implicit ARP.
             logger.info("Waiting for ARP reply from %s", participant.mac_address)
+            got_early_echo = False
             while True:
                 signal = await recv_channel.receive()
                 if signal == 'arp':
+                    break
+                elif signal == 'echo':
+                    got_early_echo = True
                     break
                 elif signal == 'cancel':
                     logger.info("UDP handshake cancelled for %s", participant.mac_address)
                     return
 
-            got_echo = False
-            for attempt in range(1, 5):
-                logger.info("Sending UDP handshake to %s (attempt %d/2)", participant.mac_address, attempt)
+            if not got_early_echo:
+                # Normal path: send trigger UDP, then wait for participant's UDP back.
+                logger.info("Sending UDP trigger to %s", participant.mac_address)
                 await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
                 ip_id = (ip_id + 1) & 0xFFFF
 
                 while True:
                     signal = await recv_channel.receive()
                     if signal == 'echo':
-                        got_echo = True
-                        # await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
-                        # ip_id = (ip_id + 1) & 0xFFFF
-                        logger.info("UDP handshake complete with %s", participant.mac_address)
-                        break
-                    elif signal == 'icmp':
                         break
                     elif signal == 'cancel':
                         logger.info("UDP handshake cancelled for %s", participant.mac_address)
                         return
 
-                if got_echo:
-                    break
-
-            if not got_echo:
-                logger.info("Retries exhausted, waiting for UDP echo from %s", participant.mac_address)
-                while True:
-                    signal = await recv_channel.receive()
-                    if signal == 'echo':
-                        break
-                    elif signal == 'cancel':
-                        logger.info("UDP handshake cancelled for %s", participant.mac_address)
-                        return
-
-            # Send one final packet after receiving the echo.
-            logger.info("UDP handshake complete with %s", participant.mac_address)
+            logger.info("Echoing UDP back to %s", participant.mac_address)
             await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
             ip_id = (ip_id + 1) & 0xFFFF
 

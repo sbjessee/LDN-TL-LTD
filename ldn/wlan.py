@@ -92,6 +92,7 @@ WLAN_EID_SUPPORTED_CHANNELS = 36
 WLAN_EID_HT_CAPABILITY = 45
 WLAN_EID_RSN = 48
 WLAN_EID_EXT_SUPP_RATES = 50
+WLAN_EID_HT_OPERATION = 61
 WLAN_EID_EXT_CAPABILITY = 127
 WLAN_EID_VENDOR_SPECIFIC = 221
 
@@ -794,6 +795,7 @@ class DataFrame:
 
     subtype: int = 0
     qos_control: int = 0
+    sequence_control: int = 0
     has_fcs: bool = False # Set this to true to trim the hardware FCS if it was captured by the sniffer
 
     payload: bytes = b""
@@ -815,6 +817,7 @@ class DataFrame:
         self.target = header.address1
         self.source = header.address2
         self.bssid = header.address3
+        self.sequence_control = header.sequence_control
 
         if self.subtype == 8:
             self.qos_control = stream.u16() 
@@ -844,11 +847,12 @@ class DataFrame:
     def encode(self) -> bytes:
         header = MACHeader()
         header.type = IEEE80211_FTYPE_DATA
-        header.subtype = self.subtype 
+        header.subtype = self.subtype
         header.address1 = self.target
         header.address2 = self.source
         header.address3 = self.bssid
         header.flags = self.tods | (self.fromds << 1) | (self.protected << 6)
+        header.sequence_control = self.sequence_control
         
         stream = streams.StreamOut("<")
         stream.write(header.encode())
@@ -1674,9 +1678,25 @@ class AccessPoint(Interface):
         response = AssociationResponse()
         response.source = self.address()
         response.target = address
-        response.capability_information = 0x0611  # ESS + Privacy + ShortSlot + QoS
+        response.capability_information = 0x0411  # ESS + Privacy + ShortSlot
         response.status_code = WLAN_STATUS_SUCCESS
         response.aid = aid | 0xC000
+        ht_capabilities = (
+            b'\x00\x00'                  # HT Capability Info
+            b'\x17'                      # A-MPDU params
+            b'\xff' + bytes(15)          # Supported MCS set (16 bytes: MCS 0-7 only)
+            + b'\x00\x00'               # HT Extended Capabilities
+            + b'\x00\x00\x00\x00'       # Tx Beamforming
+            + b'\x00'                   # Antenna Selection
+        )
+        ht_operation = (
+            bytes([self._channel])  # Primary channel
+            + bytes([0x08])         # HT Info subset 1 (RIFS permitted)
+            + bytes([0x04, 0x00])   # HT Info subset 2 LE
+            + bytes([0x00, 0x00])   # HT Info subset 3 LE
+            + bytes(16)             # Basic MCS set
+        )
+        ext_capabilities = bytes([0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
         # WMM Parameter Element: OUI 00:50:F2, type 2, subtype 1, version 1,
         # QoS info 0, reserved 0, then default EDCA params for BE/BK/VI/VO.
         wmm_ie = bytes.fromhex(
@@ -1689,6 +1709,10 @@ class AccessPoint(Interface):
         )
         response.elements = {
             WLAN_EID_SUPP_RATES: rates.encode(),
+            WLAN_EID_EXT_SUPP_RATES: bytes([0x0c, 0x12, 0x18, 0x60]),
+            WLAN_EID_HT_CAPABILITY: ht_capabilities,
+            WLAN_EID_HT_OPERATION: ht_operation,
+            WLAN_EID_EXT_CAPABILITY: ext_capabilities,
             WLAN_EID_VENDOR_SPECIFIC: [
                 bytes.fromhex("001018") + bytes([0x02]) + bytes.fromhex("00001c0000"),
                 wmm_ie,
