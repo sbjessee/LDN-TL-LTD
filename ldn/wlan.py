@@ -857,7 +857,7 @@ class DataFrame:
         stream = streams.StreamOut("<")
         stream.write(header.encode())
 
-        if self.subtype == 8:
+        if self.subtype & 8:
             stream.u16(self.qos_control)
 
         if self.protected:
@@ -1559,7 +1559,8 @@ class AccessPoint(Interface):
         
         self._stations_by_id = {}
         self._stations_by_address = {}
-        
+        self._broadcom_state: int = 0
+
         self._events = queue.create()
 
     async def next_event(self):
@@ -1625,12 +1626,67 @@ class AccessPoint(Interface):
         frame = BeaconFrame()
         frame.source = self.address()
         frame.beacon_interval = 100
-        frame.capability_information = 0x0711  # ESS + Privacy + SpectrumMgmt + ShortSlot + QoS
+        frame.capability_information = 0x0511  # ESS + Privacy + SpectrumMgmt + ShortSlot + QoS
         return frame.encode()
     
     def _create_beacon_tail(self) -> bytes:
-        """Returns the beacon tail."""
-        return b"" # No beacon tail for now
+        def ie(eid: int, data: bytes) -> bytes:
+            return bytes([eid, len(data)]) + data
+
+        rsn = RSNElement(
+            group_cipher_suite=WLAN_CIPHER_SUITE_CCMP,
+            pairwise_cipher_suites=[WLAN_CIPHER_SUITE_CCMP],
+            akm_suites=[WLAN_AKM_SUITE_PSK],
+            capabilities=12,
+        ).encode()
+
+        ht_capabilities = (
+            b'\x00\x00'                # HT Capability Info
+            b'\x17'                    # A-MPDU params
+            + b'\xff' + bytes(15)      # Supported MCS set
+            + b'\x00\x00'              # HT Extended Capabilities
+            + b'\x00\x00\x00\x00'      # Tx Beamforming
+            + b'\x00'                  # Antenna Selection
+        )
+        ht_operation = (
+            bytes([self._channel])
+            + b'\x08'           # HT Info subset 1 (RIFS permitted)
+            + b'\x00\x00'       # HT Info subset 2
+            + b'\x00\x00'       # HT Info subset 3
+            + bytes(16)         # Basic MCS set
+        )
+
+        broadcom = bytes.fromhex("001018") + bytes([0x02, self._broadcom_state]) + bytes.fromhex("001c0000")
+        nintendo = bytes.fromhex("0022aa") + bytes([0x10]) + bytes.fromhex("0101")
+        wmm = bytes.fromhex("0050f2020101810003a6000027a400004243 5e0062322f00".replace(" ", ""))
+
+        return (
+            ie(WLAN_EID_SSID, bytes(32))                                            # hidden SSID
+            + ie(WLAN_EID_SUPP_RATES, bytes([0x82, 0x84, 0x8B, 0x96, 0x24, 0x30, 0x48, 0x6C]))
+            + ie(WLAN_EID_DS_PARAMS, bytes([self._channel]))
+            + ie(5,  bytes([1, 2, 0, 0]))                                           # TIM
+            + ie(7,  bytes([0x55, 0x53, 0x20, 0x01, 0x0d, 0x1e]))                  # Country: US
+            + ie(32, bytes([0x00]))                                                 # Power Constraint
+            + ie(35, bytes([0x11, 0x00]))                                           # TPC Report: 17 dBm
+            + ie(42, bytes([0x00]))                                                 # ERP Info
+            + ie(WLAN_EID_EXT_SUPP_RATES, bytes([0x0c, 0x12, 0x18, 0x60]))
+            + ie(WLAN_EID_RSN, rsn)
+            + ie(WLAN_EID_HT_CAPABILITY, ht_capabilities)
+            + ie(WLAN_EID_HT_OPERATION, ht_operation)
+            + ie(WLAN_EID_EXT_CAPABILITY, bytes([0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40]))
+            + ie(WLAN_EID_VENDOR_SPECIFIC, nintendo)
+            + ie(WLAN_EID_VENDOR_SPECIFIC, broadcom)
+            + ie(WLAN_EID_VENDOR_SPECIFIC, wmm)
+        )
+
+    async def set_broadcom_state(self, state: int) -> None:
+        self._broadcom_state = state
+        attrs = {
+            nl80211.NL80211_ATTR_IFINDEX: self.index(),
+            nl80211.NL80211_ATTR_BEACON_HEAD: self._create_beacon_head(),
+            nl80211.NL80211_ATTR_BEACON_TAIL: self._create_beacon_tail(),
+        }
+        await self._wlan.request(nl80211.NL80211_CMD_SET_BEACON, attrs)
     
     def _create_probe_response(self, address: MACAddress) -> bytes:
         """Creates and encodes a probe response frame for the given address."""

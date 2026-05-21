@@ -1950,6 +1950,20 @@ class APNetwork:
             ip_id=ip_id, options=options
         ))
 
+    async def _send_qos_null(self, participant: ParticipantInfo) -> None:
+        frame = wlan.DataFrame()
+        frame.subtype = 12
+        frame.target = participant.mac_address
+        frame.source = self._interface.address()
+        frame.bssid = self._interface.address()
+        frame.fromds = True
+        frame.tods = False
+        frame.payload = b''
+        if self._key:
+            self._data_nonce += 1
+            frame.encrypt(self._key, self._data_nonce, 0)
+        await self._monitor.send_frame(frame)
+
     async def _do_udp_handshake(
         self, participant: ParticipantInfo,
         send_channel: trio.MemorySendChannel,
@@ -2056,6 +2070,7 @@ class APNetwork:
                         logger.info("TCP handshake cancelled for %s", participant.mac_address)
                         return
                 logger.info("Incoming TCP handshake complete with %s", participant.mac_address)
+                await self._interface.set_broadcom_state(1)
                 our_seq_data = (in_isn + 1) & 0xFFFFFFFF
                 initial_our_seq = our_seq_data
                 ooo: list[tuple[int, bytes]] = []  # out-of-order: (seq, payload)
@@ -2097,41 +2112,53 @@ class APNetwork:
                     return ((b - a) & 0xFFFFFFFF) < 0x80000000
 
                 logger.info("Streaming TCP data from %s", participant.mac_address)
-                try:
-                    while True:
-                        signal = await in_recv.receive()
-                        if isinstance(signal, tuple) and signal[0] == 'data':
-                            _, pkt_seq, pkt_payload, _psh, remote_ack = signal
-                            _forward_ack(remote_ack)
-                            new_ack = (pkt_seq + len(pkt_payload)) & 0xFFFFFFFF
-                            await self._send_tcp(participant, 5002, client_src_port, b'',
-                                                 seq=our_seq_data, ack_num=new_ack, flags=0x10,
-                                                 ip_id=ip_id)
-                            ip_id = (ip_id + 1) & 0xFFFF
-                            if pkt_seq == expected_seq:
-                                await _deliver(pkt_payload)
-                                await _drain_ooo()
-                            elif _seq_lt(expected_seq, pkt_seq):
-                                if not any(s == pkt_seq for s, _ in ooo):
-                                    ooo.append((pkt_seq, pkt_payload))
-                        elif isinstance(signal, tuple) and signal[0] == 'ack':
-                            _, remote_ack = signal
-                            _forward_ack(remote_ack)
-                        elif isinstance(signal, tuple) and signal[0] == 'fin':
-                            _, pkt_seq, fin_data_len, remote_ack = signal
-                            _forward_ack(remote_ack)
-                            new_ack = (pkt_seq + fin_data_len + 1) & 0xFFFFFFFF
-                            await self._send_tcp(participant, 5002, client_src_port, b'',
-                                                 seq=our_seq_data, ack_num=new_ack, flags=0x10,
-                                                 ip_id=ip_id)
-                            ip_id = (ip_id + 1) & 0xFFFF
-                            break
-                        elif signal == 'cancel':
-                            logger.info("TCP data loop cancelled for %s", participant.mac_address)
-                            return
-                finally:
-                    await data_send.aclose()
-                    await ack_send.aclose()
+                _keepalive_scope = trio.CancelScope()
+
+                async def _qos_keepalive() -> None:
+                    with _keepalive_scope:
+                        while True:
+                            await trio.sleep(4)
+                            await self._send_qos_null(participant)
+
+                async with trio.open_nursery() as _kn:
+                    _kn.start_soon(_qos_keepalive)
+                    try:
+                        while True:
+                            signal = await in_recv.receive()
+                            if isinstance(signal, tuple) and signal[0] == 'data':
+                                _, pkt_seq, pkt_payload, _psh, remote_ack = signal
+                                _forward_ack(remote_ack)
+                                new_ack = (pkt_seq + len(pkt_payload)) & 0xFFFFFFFF
+                                await self._send_tcp(participant, 5002, client_src_port, b'',
+                                                     seq=our_seq_data, ack_num=new_ack, flags=0x10,
+                                                     ip_id=ip_id)
+                                ip_id = (ip_id + 1) & 0xFFFF
+                                if pkt_seq == expected_seq:
+                                    await _deliver(pkt_payload)
+                                    await _drain_ooo()
+                                elif _seq_lt(expected_seq, pkt_seq):
+                                    if not any(s == pkt_seq for s, _ in ooo):
+                                        ooo.append((pkt_seq, pkt_payload))
+                            elif isinstance(signal, tuple) and signal[0] == 'ack':
+                                _, remote_ack = signal
+                                _forward_ack(remote_ack)
+                            elif isinstance(signal, tuple) and signal[0] == 'fin':
+                                _, pkt_seq, fin_data_len, remote_ack = signal
+                                _forward_ack(remote_ack)
+                                new_ack = (pkt_seq + fin_data_len + 1) & 0xFFFFFFFF
+                                await self._send_tcp(participant, 5002, client_src_port, b'',
+                                                     seq=our_seq_data, ack_num=new_ack, flags=0x10,
+                                                     ip_id=ip_id)
+                                ip_id = (ip_id + 1) & 0xFFFF
+                                _keepalive_scope.cancel()
+                                break
+                            elif signal == 'cancel':
+                                logger.info("TCP data loop cancelled for %s", participant.mac_address)
+                                _keepalive_scope.cancel()
+                                return
+                    finally:
+                        await data_send.aclose()
+                        await ack_send.aclose()
             finally:
                 self._tcp_channels.pop(participant.mac_address, None)
                 await in_send.aclose()
