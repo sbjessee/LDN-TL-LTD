@@ -77,42 +77,48 @@ def _parse_cltp_supply(buf: bytearray) -> tuple[int, int] | None:
         return None
 
 
-async def handle_tcp_stream(participant, stream, filepath, join_time):
-    import time as time_mod
-    buf = bytearray()
-
-    async with stream:
+async def handle_send_stream(participant, send_stream, filepath, join_time):
+    """Outgoing connection (our 49*** → their 5002): send data stream, read CLTP ACCEPT."""
+    async with send_stream:
         if filepath is not None:
             remaining = CLTP_SEND_DELAY - (trio.current_time() - join_time)
+            print(f"Will send {filepath!r} to {participant.mac_address} after {remaining:.0f}s.")
             if remaining > 0:
                 await trio.sleep(remaining)
 
             data = pathlib.Path(filepath).read_bytes()
             header = f'CLTP SUPPLY 0x{len(data) + 1:x}\x00'.encode('ascii')
-            await stream.send(header, push=True)
-            await stream.wait_all_acked()
+            await send_stream.send(header, push=True)
+            # await send_stream.wait_all_acked()
 
             chunks = [data[i:i + CLTP_CHUNK_SIZE] for i in range(0, len(data), CLTP_CHUNK_SIZE)]
             for idx, chunk in enumerate(chunks):
-                await stream.wait_window(3)
+                await send_stream.wait_window(3)
                 is_last = idx == len(chunks) - 1
-                await stream.send(chunk + b'\x00' if is_last else chunk, push=is_last)
-            await stream.wait_all_acked()
+                await send_stream.send(chunk + b'\x00' if is_last else chunk, push=is_last)
+            await send_stream.wait_all_acked()
 
             resp_buf = bytearray()
-            with trio.move_on_after(5):
-                while b'\x00' not in resp_buf:
-                    resp_buf.extend(await stream.receive())
+            while b'\x00' not in resp_buf:
+                resp_buf.extend(await send_stream.receive())
             null_idx = resp_buf.find(0)
-            if null_idx != -1:
-                response = resp_buf[:null_idx].decode('ascii', errors='replace')
-                print(f"CLTP response from {participant.mac_address}: {response!r}")
-                buf = bytearray(resp_buf[null_idx + 1:])
+            response = resp_buf[:null_idx].decode('ascii', errors='replace')
+            if response == 'CLTP ACCEPT':
+                print(f"{participant.mac_address} accepted the transfer.")
+            elif response == 'CLTP REJECT':
+                print(f"{participant.mac_address} rejected the transfer.")
             else:
-                print(f"No CLTP response received from {participant.mac_address}")
-                buf = bytearray(resp_buf)
+                print(f"Unexpected CLTP response from {participant.mac_address}: {response!r}")
+        async for _ in send_stream:
+            pass
 
-        async for chunk in stream:
+
+async def handle_recv_stream(participant, recv_stream):
+    """Incoming connection (their 49*** → our 5002): receive their data stream, send CLTP ACCEPT."""
+    import time as time_mod
+    buf = bytearray()
+    async with recv_stream:
+        async for chunk in recv_stream:
             buf.extend(chunk)
             while True:
                 parsed = _parse_cltp_supply(buf)
@@ -129,7 +135,7 @@ async def handle_tcp_stream(participant, stream, filepath, join_time):
                 out = pathlib.Path(f"cltp_{int(time_mod.time())}.bin")
                 out.write_bytes(payload)
                 print(f"CLTP SUPPLY {data_len} bytes from {participant.mac_address} → {out}")
-                await stream.send(b'CLTP ACCEPT\x00')
+                await recv_stream.send(b'CLTP ACCEPT\x00')
 
 
 async def process_events(network, nursery, filepath):
@@ -148,7 +154,8 @@ async def process_events(network, nursery, filepath):
             print("%s left the network (%s / %s)" %(participant.name.decode(), participant.mac_address, participant.ip_address))
         elif isinstance(event, ldn.TCPStreamEvent):
             join_time = join_times.get(str(event.participant.mac_address), trio.current_time())
-            nursery.start_soon(handle_tcp_stream, event.participant, event.stream, filepath, join_time)
+            nursery.start_soon(handle_send_stream, event.participant, event.send_stream, filepath, join_time)
+            nursery.start_soon(handle_recv_stream, event.participant, event.recv_stream)
 
 
 async def main():

@@ -1230,7 +1230,8 @@ class TCPStream:
 @dataclass
 class TCPStreamEvent:
     participant: ParticipantInfo
-    stream: TCPStream
+    send_stream: TCPStream   # outgoing: our 49*** → their 5002; use to upload + receive their response
+    recv_stream: TCPStream   # incoming: their 49*** → our 5002; use to receive their upload + respond
 
 
 type EventType = DisconnectEvent | JoinEvent | LeaveEvent | \
@@ -2022,6 +2023,12 @@ class APNetwork:
             tcp_isn = random.randint(0, 0xFFFFFFFF)
             tcp_send, tcp_recv = trio.open_memory_channel(32)
             self._tcp_channels.setdefault(participant.mac_address, {})[tcp_src_port] = tcp_send
+
+            # Register port 5002 before sending SYN so console's incoming SYN isn't missed
+            in_isn = random.randint(0, 0xFFFFFFFF)
+            in_our_seq = (in_isn + 1) & 0xFFFFFFFF
+            in_send, in_recv = trio.open_memory_channel(32)
+            self._tcp_channels.setdefault(participant.mac_address, {})[5002] = in_send
             try:
                 logger.info("Sending TCP SYN to %s", participant.mac_address)
                 await self._send_tcp(participant, tcp_src_port, 5002, b'',
@@ -2046,33 +2053,18 @@ class APNetwork:
 
                 our_seq_data = (tcp_isn + 1) & 0xFFFFFFFF
                 initial_our_seq = our_seq_data
-                data_send, data_recv = trio.open_memory_channel(32)
+                data_out_send, data_out_recv = trio.open_memory_channel(32)
                 ack_send, ack_recv = trio.open_memory_channel(16)
 
-                # Tracks which connection last delivered data to the app.
-                # _tcp_app_send routes the reply on the same connection.
-                _reply_on_out: list[bool] = [True]
+                async def _outgoing_send_fn(data: bytes, push: bool = True) -> None:
+                    nonlocal our_seq_data, ip_id
+                    await self._send_tcp(participant, tcp_src_port, server_port, data,
+                                         seq=our_seq_data, ack_num=0,
+                                         flags=0x18 if push else 0x10, ip_id=ip_id)
+                    ip_id = (ip_id + 1) & 0xFFFF
+                    our_seq_data = (our_seq_data + len(data)) & 0xFFFFFFFF
 
-                async def _tcp_app_send(data: bytes, push: bool = True) -> None:
-                    nonlocal our_seq_data, in_our_seq, ip_id
-                    if _reply_on_out[0]:
-                        await self._send_tcp(participant, tcp_src_port, server_port, data,
-                                             seq=our_seq_data,
-                                             ack_num=0,
-                                             flags=0x18 if push else 0x10,
-                                             ip_id=ip_id)
-                        ip_id = (ip_id + 1) & 0xFFFF
-                        our_seq_data = (our_seq_data + len(data)) & 0xFFFFFFFF
-                    else:
-                        await self._send_tcp(participant, 5002, client_src_port, data,
-                                             seq=in_our_seq,
-                                             ack_num=expected_seq,
-                                             flags=0x18 if push else 0x10,
-                                             ip_id=ip_id)
-                        ip_id = (ip_id + 1) & 0xFFFF
-                        in_our_seq = (in_our_seq + len(data)) & 0xFFFFFFFF
-
-                def _forward_ack(remote_ack_num: int) -> None:
+                def _forward_out_ack(remote_ack_num: int) -> None:
                     rel = (remote_ack_num - initial_our_seq) & 0xFFFFFFFF
                     try:
                         ack_send.send_nowait(rel)
@@ -2080,10 +2072,8 @@ class APNetwork:
                         pass
 
                 # Incoming TCP: their 49*** → our 5002 (we receive data on this)
-                in_isn = random.randint(0, 0xFFFFFFFF)
-                in_our_seq = (in_isn + 1) & 0xFFFFFFFF
-                in_send, in_recv = trio.open_memory_channel(32)
-                self._tcp_channels.setdefault(participant.mac_address, {})[5002] = in_send
+                data_in_send, data_in_recv = trio.open_memory_channel(32)
+                in_ack_send, in_ack_recv = trio.open_memory_channel(16)
                 try:
                     logger.info("Waiting for incoming TCP SYN from %s", participant.mac_address)
                     while True:
@@ -2108,16 +2098,34 @@ class APNetwork:
                             return
                     logger.info("Incoming TCP handshake complete with %s", participant.mac_address)
 
+                    initial_in_our_seq = in_our_seq
                     ooo: list[tuple[int, bytes]] = []
                     expected_seq = (client_seq + 1) & 0xFFFFFFFF
 
+                    async def _incoming_send_fn(data: bytes, push: bool = True) -> None:
+                        nonlocal in_our_seq, ip_id
+                        await self._send_tcp(participant, 5002, client_src_port, data,
+                                             seq=in_our_seq, ack_num=expected_seq,
+                                             flags=0x18 if push else 0x10, ip_id=ip_id)
+                        ip_id = (ip_id + 1) & 0xFFFF
+                        in_our_seq = (in_our_seq + len(data)) & 0xFFFFFFFF
+
+                    def _forward_in_ack(remote_ack_num: int) -> None:
+                        rel = (remote_ack_num - initial_in_our_seq) & 0xFFFFFFFF
+                        try:
+                            in_ack_send.send_nowait(rel)
+                        except (trio.WouldBlock, trio.ClosedResourceError):
+                            pass
+
                     await self._events.put(TCPStreamEvent(
-                        participant, TCPStream(data_recv, _tcp_app_send, ack_recv)))
+                        participant,
+                        send_stream=TCPStream(data_out_recv, _outgoing_send_fn, ack_recv),
+                        recv_stream=TCPStream(data_in_recv, _incoming_send_fn, in_ack_recv)))
 
                     async def _deliver(payload: bytes) -> None:
                         nonlocal expected_seq
                         expected_seq = (expected_seq + len(payload)) & 0xFFFFFFFF
-                        await data_send.send(bytes(payload))
+                        await data_in_send.send(bytes(payload))
 
                     async def _drain_ooo() -> None:
                         ooo.sort(key=lambda x: x[0])
@@ -2141,14 +2149,13 @@ class APNetwork:
                             signal = await tcp_recv.receive()
                             if isinstance(signal, tuple) and signal[0] == 'ack':
                                 _, remote_ack = signal
-                                _forward_ack(remote_ack)
+                                _forward_out_ack(remote_ack)
                             elif isinstance(signal, tuple) and signal[0] == 'data':
                                 _, pkt_seq, pkt_payload, _psh, remote_ack = signal
-                                _forward_ack(remote_ack)
-                                _reply_on_out[0] = True
-                                await data_send.send(bytes(pkt_payload))
+                                _forward_out_ack(remote_ack)
+                                await data_out_send.send(bytes(pkt_payload))
                             elif isinstance(signal, tuple) and signal[0] == 'fin':
-                                _forward_ack(signal[-1])
+                                _forward_out_ack(signal[-1])
                                 break
                             elif signal == 'cancel':
                                 break
@@ -2167,14 +2174,13 @@ class APNetwork:
                                                          ip_id=ip_id)
                                     ip_id = (ip_id + 1) & 0xFFFF
                                     if pkt_seq == expected_seq:
-                                        _reply_on_out[0] = False
                                         await _deliver(pkt_payload)
                                         await _drain_ooo()
                                     elif _seq_lt(expected_seq, pkt_seq):
                                         if not any(s == pkt_seq for s, _ in ooo):
                                             ooo.append((pkt_seq, pkt_payload))
                                 elif isinstance(signal, tuple) and signal[0] == 'ack':
-                                    pass
+                                    _forward_in_ack(signal[1])
                                 elif isinstance(signal, tuple) and signal[0] == 'fin':
                                     _, pkt_seq, fin_data_len, _ = signal
                                     new_ack = (pkt_seq + fin_data_len + 1) & 0xFFFFFFFF
@@ -2189,16 +2195,21 @@ class APNetwork:
                                     _keepalive_scope.cancel()
                                     return
                         finally:
-                            await data_send.aclose()
+                            await data_out_send.aclose()
+                            await data_in_send.aclose()
                             await ack_send.aclose()
+                            await in_ack_send.aclose()
                 finally:
                     self._tcp_channels.get(participant.mac_address, {}).pop(5002, None)
                     await in_send.aclose()
                     await in_recv.aclose()
             finally:
                 self._tcp_channels.get(participant.mac_address, {}).pop(tcp_src_port, None)
+                self._tcp_channels.get(participant.mac_address, {}).pop(5002, None)
                 await tcp_send.aclose()
                 await tcp_recv.aclose()
+                await in_send.aclose()
+                await in_recv.aclose()
         finally:
             self._arp_channels.pop(participant.mac_address, None)
             self._udp_channels.pop(participant.mac_address, None)
@@ -2312,8 +2323,9 @@ class APNetwork:
         await self._tap.add_address(host.ip_address, broadcast_addr)
     
     async def _destroy_network(self) -> None:
+        own_address = self._interface.address()
         for participant in self._network.participants:
-            if participant.connected:
+            if participant.connected and participant.mac_address != own_address:
                 frame = DisconnectFrame()
                 frame.reason = DISCONNECT_NETWORK_DESTROYED
                 logger.info("Sending disconnect to %s", participant.mac_address)
