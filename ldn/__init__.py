@@ -2141,7 +2141,7 @@ class APNetwork:
                     async def _qos_keepalive() -> None:
                         with _keepalive_scope:
                             while True:
-                                await trio.sleep(4)
+                                await trio.sleep(10)
                                 await self._send_qos_null(participant)
 
                     async def _outgoing_ack_task() -> None:
