@@ -1178,28 +1178,44 @@ class AcceptPolicyChanged:
 
 class TCPStream:
     def __init__(self, recv_channel: trio.MemoryReceiveChannel, send_fn,
-                 ack_channel: trio.MemoryReceiveChannel) -> None:
+                 ack_channel: trio.MemoryReceiveChannel,
+                 retransmit_fn=None) -> None:
         self._recv = recv_channel
         self._send_fn = send_fn
         self._ack_recv = ack_channel
+        self._retransmit_fn = retransmit_fn
         self._bytes_sent: int = 0
         self._bytes_acked: int = 0
-        self._segments: list[int] = []  # cumulative byte end of each unACKed send
+        self._segments: list[tuple[int, bytes, bool]] = []  # (cumulative_end, data, push)
 
     def _process_ack(self, relative_ack: int) -> None:
         self._bytes_acked = max(self._bytes_acked, relative_ack)
-        while self._segments and self._segments[0] <= self._bytes_acked:
+        while self._segments and self._segments[0][0] <= self._bytes_acked:
             self._segments.pop(0)
 
+    async def _retransmit_pending(self) -> None:
+        if not self._retransmit_fn:
+            return
+        start = self._bytes_acked
+        for end, data, push in self._segments:
+            await self._retransmit_fn(start, data, push)
+            start = end
+
     async def wait_window(self, max_unacked: int) -> None:
-        """Block until fewer than max_unacked segments are in flight."""
+        """Block until fewer than max_unacked segments are in flight, retransmitting on timeout."""
         while len(self._segments) >= max_unacked:
-            self._process_ack(await self._ack_recv.receive())
+            with trio.move_on_after(2.0) as scope:
+                self._process_ack(await self._ack_recv.receive())
+            if scope.cancelled_caught and len(self._segments) >= max_unacked:
+                await self._retransmit_pending()
 
     async def wait_all_acked(self) -> None:
-        """Block until all sent segments have been ACKed."""
+        """Block until all sent segments have been ACKed, retransmitting on timeout."""
         while self._segments:
-            self._process_ack(await self._ack_recv.receive())
+            with trio.move_on_after(2.0) as scope:
+                self._process_ack(await self._ack_recv.receive())
+            if scope.cancelled_caught and self._segments:
+                await self._retransmit_pending()
 
     async def receive(self) -> bytes:
         return await self._recv.receive()
@@ -1207,7 +1223,7 @@ class TCPStream:
     async def send(self, data: bytes, push: bool = True) -> None:
         await self._send_fn(data, push)
         self._bytes_sent += len(data)
-        self._segments.append(self._bytes_sent)
+        self._segments.append((self._bytes_sent, data, push))
 
     def __aiter__(self):
         return self
@@ -2041,6 +2057,7 @@ class APNetwork:
                     signal = await tcp_recv.receive()
                     if isinstance(signal, tuple) and signal[0] == 'syn_ack':
                         server_seq, server_port = signal[1], signal[2]
+                        server_ack = (server_seq + 1) & 0xFFFFFFFF
                         break
                     elif signal == 'cancel':
                         logger.info("TCP handshake cancelled for %s", participant.mac_address)
@@ -2061,10 +2078,18 @@ class APNetwork:
                 async def _outgoing_send_fn(data: bytes, push: bool = True) -> None:
                     nonlocal our_seq_data, ip_id
                     await self._send_tcp(participant, tcp_src_port, server_port, data,
-                                         seq=our_seq_data, ack_num=0,
+                                         seq=our_seq_data, ack_num=server_ack,
                                          flags=0x18 if push else 0x10, ip_id=ip_id)
                     ip_id = (ip_id + 1) & 0xFFFF
                     our_seq_data = (our_seq_data + len(data)) & 0xFFFFFFFF
+
+                async def _outgoing_retransmit_fn(byte_offset: int, data: bytes, push: bool) -> None:
+                    nonlocal ip_id
+                    seq = (initial_our_seq + byte_offset) & 0xFFFFFFFF
+                    await self._send_tcp(participant, tcp_src_port, server_port, data,
+                                         seq=seq, ack_num=server_ack,
+                                         flags=0x18 if push else 0x10, ip_id=ip_id)
+                    ip_id = (ip_id + 1) & 0xFFFF
 
                 def _forward_out_ack(remote_ack_num: int) -> None:
                     rel = (remote_ack_num - initial_our_seq) & 0xFFFFFFFF
@@ -2112,6 +2137,14 @@ class APNetwork:
                         ip_id = (ip_id + 1) & 0xFFFF
                         in_our_seq = (in_our_seq + len(data)) & 0xFFFFFFFF
 
+                    async def _incoming_retransmit_fn(byte_offset: int, data: bytes, push: bool) -> None:
+                        nonlocal ip_id
+                        seq = (initial_in_our_seq + byte_offset) & 0xFFFFFFFF
+                        await self._send_tcp(participant, 5002, client_src_port, data,
+                                             seq=seq, ack_num=expected_seq,
+                                             flags=0x18 if push else 0x10, ip_id=ip_id)
+                        ip_id = (ip_id + 1) & 0xFFFF
+
                     def _forward_in_ack(remote_ack_num: int) -> None:
                         rel = (remote_ack_num - initial_in_our_seq) & 0xFFFFFFFF
                         try:
@@ -2121,8 +2154,8 @@ class APNetwork:
 
                     await self._events.put(TCPStreamEvent(
                         participant,
-                        send_stream=TCPStream(data_out_recv, _outgoing_send_fn, ack_recv),
-                        recv_stream=TCPStream(data_in_recv, _incoming_send_fn, in_ack_recv)))
+                        send_stream=TCPStream(data_out_recv, _outgoing_send_fn, ack_recv, _outgoing_retransmit_fn),
+                        recv_stream=TCPStream(data_in_recv, _incoming_send_fn, in_ack_recv, _incoming_retransmit_fn)))
 
                     async def _deliver(payload: bytes) -> None:
                         nonlocal expected_seq
@@ -2147,6 +2180,7 @@ class APNetwork:
                                 await self._send_qos_null(participant)
 
                     async def _outgoing_ack_task() -> None:
+                        nonlocal ip_id
                         while True:
                             signal = await tcp_recv.receive()
                             if isinstance(signal, tuple) and signal[0] == 'ack':
@@ -2155,8 +2189,22 @@ class APNetwork:
                             elif isinstance(signal, tuple) and signal[0] == 'data':
                                 _, pkt_seq, pkt_payload, _psh, remote_ack = signal
                                 _forward_out_ack(remote_ack)
-                                await data_out_send.send(bytes(pkt_payload))
+                                new_ack = (pkt_seq + len(pkt_payload)) & 0xFFFFFFFF
+                                await self._send_tcp(participant, tcp_src_port, server_port, b'',
+                                                     seq=our_seq_data, ack_num=new_ack, flags=0x10,
+                                                     ip_id=ip_id)
+                                ip_id = (ip_id + 1) & 0xFFFF
+                                try:
+                                    await data_out_send.send(bytes(pkt_payload))
+                                except trio.ClosedResourceError:
+                                    break
                             elif isinstance(signal, tuple) and signal[0] == 'fin':
+                                _, fin_seq, fin_data_len, _ = signal
+                                new_ack = (fin_seq + fin_data_len + 1) & 0xFFFFFFFF
+                                await self._send_tcp(participant, tcp_src_port, server_port, b'',
+                                                     seq=our_seq_data, ack_num=new_ack, flags=0x10,
+                                                     ip_id=ip_id)
+                                ip_id = (ip_id + 1) & 0xFFFF
                                 _forward_out_ack(signal[-1])
                                 break
                             elif signal == 'cancel':

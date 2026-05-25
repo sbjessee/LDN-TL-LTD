@@ -89,7 +89,7 @@ async def handle_send_stream(participant, send_stream, filepath, join_time):
             data = pathlib.Path(filepath).read_bytes()
             header = f'CLTP SUPPLY 0x{len(data) + 1:x}\x00'.encode('ascii')
             await send_stream.send(header, push=True)
-            # await send_stream.wait_all_acked()
+            await send_stream.wait_all_acked()
 
             chunks = [data[i:i + CLTP_CHUNK_SIZE] for i in range(0, len(data), CLTP_CHUNK_SIZE)]
             for idx, chunk in enumerate(chunks):
