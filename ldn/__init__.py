@@ -2036,185 +2036,191 @@ class APNetwork:
             await self._send_udp(participant, 5001, 5001, b'\x01\x00\x00\x00', ip_id=ip_id)
             ip_id = (ip_id + 1) & 0xFFFF
 
-            # Outgoing TCP: our 49*** → their 5002 (we send data on this)
-            tcp_src_port = 49200 + random.randint(0, 9)
-            tcp_isn = random.randint(0, 0xFFFFFFFF)
-            tcp_send, tcp_recv = trio.open_memory_channel(32)
-            self._tcp_channels.setdefault(participant.mac_address, {})[tcp_src_port] = tcp_send
-
-            # Register port 5002 before sending SYN so console's incoming SYN isn't missed
+            # Register port 5002 once — kept alive across all sequential connections for this participant
             in_isn = random.randint(0, 0xFFFFFFFF)
-            in_our_seq = (in_isn + 1) & 0xFFFFFFFF
             in_send, in_recv = trio.open_memory_channel(32)
             self._tcp_channels.setdefault(participant.mac_address, {})[5002] = in_send
+
+            out_conn_idx = 0
             try:
-                logger.info("Sending TCP SYN to %s", participant.mac_address)
-                await self._send_tcp(participant, tcp_src_port, 5002, b'',
-                                     seq=tcp_isn, ack_num=0, flags=0x02,
-                                     ip_id=ip_id)
-                ip_id = (ip_id + 1) & 0xFFFF
-                while True:
-                    signal = await tcp_recv.receive()
-                    if isinstance(signal, tuple) and signal[0] == 'syn_ack':
-                        server_seq, server_port = signal[1], signal[2]
-                        server_ack = (server_seq + 1) & 0xFFFFFFFF
-                        break
-                    elif signal == 'cancel':
-                        logger.info("TCP handshake cancelled for %s", participant.mac_address)
-                        return
-                await self._send_tcp(participant, tcp_src_port, server_port, b'',
-                                     seq=(tcp_isn + 1) & 0xFFFFFFFF,
-                                     ack_num=(server_seq + 1) & 0xFFFFFFFF,
-                                     flags=0x10, ip_id=ip_id)
-                ip_id = (ip_id + 1) & 0xFFFF
-                logger.info("TCP handshake complete with %s", participant.mac_address)
-                await self._interface.set_broadcom_state(1)
-
-                our_seq_data = (tcp_isn + 1) & 0xFFFFFFFF
-                initial_our_seq = our_seq_data
-                data_out_send, data_out_recv = trio.open_memory_channel(32)
-                ack_send, ack_recv = trio.open_memory_channel(16)
-
-                async def _outgoing_send_fn(data: bytes, push: bool = True) -> None:
-                    nonlocal our_seq_data, ip_id
-                    await self._send_tcp(participant, tcp_src_port, server_port, data,
-                                         seq=our_seq_data, ack_num=server_ack,
-                                         flags=0x18 if push else 0x10, ip_id=ip_id)
-                    ip_id = (ip_id + 1) & 0xFFFF
-                    our_seq_data = (our_seq_data + len(data)) & 0xFFFFFFFF
-
-                async def _outgoing_retransmit_fn(byte_offset: int, data: bytes, push: bool) -> None:
-                    nonlocal ip_id
-                    seq = (initial_our_seq + byte_offset) & 0xFFFFFFFF
-                    await self._send_tcp(participant, tcp_src_port, server_port, data,
-                                         seq=seq, ack_num=server_ack,
-                                         flags=0x18 if push else 0x10, ip_id=ip_id)
-                    ip_id = (ip_id + 1) & 0xFFFF
-
-                def _forward_out_ack(remote_ack_num: int) -> None:
-                    rel = (remote_ack_num - initial_our_seq) & 0xFFFFFFFF
+                while True:  # one iteration per TCP connection pair
+                    tcp_src_port = 49200 + out_conn_idx
+                    tcp_isn = random.randint(0, 0xFFFFFFFF)
+                    in_our_seq = (in_isn + 1) & 0xFFFFFFFF
+                    tcp_send, tcp_recv = trio.open_memory_channel(32)
+                    data_out_send, data_out_recv = trio.open_memory_channel(32)
+                    ack_send, ack_recv = trio.open_memory_channel(16)
+                    data_in_send, data_in_recv = trio.open_memory_channel(32)
+                    in_ack_send, in_ack_recv = trio.open_memory_channel(16)
+                    self._tcp_channels.setdefault(participant.mac_address, {})[tcp_src_port] = tcp_send
                     try:
-                        ack_send.send_nowait(rel)
-                    except (trio.WouldBlock, trio.ClosedResourceError):
-                        pass
-
-                # Incoming TCP: their 49*** → our 5002 (we receive data on this)
-                data_in_send, data_in_recv = trio.open_memory_channel(32)
-                in_ack_send, in_ack_recv = trio.open_memory_channel(16)
-                try:
-                    logger.info("Waiting for incoming TCP SYN from %s", participant.mac_address)
-                    while True:
-                        signal = await in_recv.receive()
-                        if isinstance(signal, tuple) and signal[0] == 'syn':
-                            client_seq, client_src_port = signal[1], signal[2]
-                            break
-                        elif signal == 'cancel':
-                            logger.info("TCP handshake cancelled for %s", participant.mac_address)
-                            return
-                    await self._send_tcp(participant, 5002, client_src_port, b'',
-                                         seq=in_isn,
-                                         ack_num=(client_seq + 1) & 0xFFFFFFFF,
-                                         flags=0x12, ip_id=ip_id)
-                    ip_id = (ip_id + 1) & 0xFFFF
-                    while True:
-                        signal = await in_recv.receive()
-                        if isinstance(signal, tuple) and signal[0] == 'ack':
-                            break
-                        elif signal == 'cancel':
-                            logger.info("TCP handshake cancelled for %s", participant.mac_address)
-                            return
-                    logger.info("Incoming TCP handshake complete with %s", participant.mac_address)
-
-                    initial_in_our_seq = in_our_seq
-                    ooo: list[tuple[int, bytes]] = []
-                    expected_seq = (client_seq + 1) & 0xFFFFFFFF
-
-                    async def _incoming_send_fn(data: bytes, push: bool = True) -> None:
-                        nonlocal in_our_seq, ip_id
-                        await self._send_tcp(participant, 5002, client_src_port, data,
-                                             seq=in_our_seq, ack_num=expected_seq,
-                                             flags=0x18 if push else 0x10, ip_id=ip_id)
+                        # Outgoing TCP handshake: our tcp_src_port → their 5002
+                        logger.info("Sending TCP SYN to %s (port %d)", participant.mac_address, tcp_src_port)
+                        await self._send_tcp(participant, tcp_src_port, 5002, b'',
+                                             seq=tcp_isn, ack_num=0, flags=0x02,
+                                             ip_id=ip_id)
                         ip_id = (ip_id + 1) & 0xFFFF
-                        in_our_seq = (in_our_seq + len(data)) & 0xFFFFFFFF
-
-                    async def _incoming_retransmit_fn(byte_offset: int, data: bytes, push: bool) -> None:
-                        nonlocal ip_id
-                        seq = (initial_in_our_seq + byte_offset) & 0xFFFFFFFF
-                        await self._send_tcp(participant, 5002, client_src_port, data,
-                                             seq=seq, ack_num=expected_seq,
-                                             flags=0x18 if push else 0x10, ip_id=ip_id)
-                        ip_id = (ip_id + 1) & 0xFFFF
-
-                    def _forward_in_ack(remote_ack_num: int) -> None:
-                        rel = (remote_ack_num - initial_in_our_seq) & 0xFFFFFFFF
-                        try:
-                            in_ack_send.send_nowait(rel)
-                        except (trio.WouldBlock, trio.ClosedResourceError):
-                            pass
-
-                    await self._events.put(TCPStreamEvent(
-                        participant,
-                        send_stream=TCPStream(data_out_recv, _outgoing_send_fn, ack_recv, _outgoing_retransmit_fn),
-                        recv_stream=TCPStream(data_in_recv, _incoming_send_fn, in_ack_recv, _incoming_retransmit_fn)))
-
-                    async def _deliver(payload: bytes) -> None:
-                        nonlocal expected_seq
-                        expected_seq = (expected_seq + len(payload)) & 0xFFFFFFFF
-                        await data_in_send.send(bytes(payload))
-
-                    async def _drain_ooo() -> None:
-                        ooo.sort(key=lambda x: x[0])
-                        while ooo and ooo[0][0] == expected_seq:
-                            await _deliver(ooo.pop(0)[1])
-
-                    def _seq_lt(a: int, b: int) -> bool:
-                        return ((b - a) & 0xFFFFFFFF) < 0x80000000
-
-                    logger.info("Streaming TCP data from %s", participant.mac_address)
-                    _keepalive_scope = trio.CancelScope()
-
-                    async def _qos_keepalive() -> None:
-                        with _keepalive_scope:
-                            while True:
-                                await trio.sleep(10)
-                                await self._send_qos_null(participant)
-
-                    async def _outgoing_ack_task() -> None:
-                        nonlocal ip_id
                         while True:
                             signal = await tcp_recv.receive()
-                            if isinstance(signal, tuple) and signal[0] == 'ack':
-                                _, remote_ack = signal
-                                _forward_out_ack(remote_ack)
-                            elif isinstance(signal, tuple) and signal[0] == 'data':
-                                _, pkt_seq, pkt_payload, _psh, remote_ack = signal
-                                _forward_out_ack(remote_ack)
-                                new_ack = (pkt_seq + len(pkt_payload)) & 0xFFFFFFFF
-                                await self._send_tcp(participant, tcp_src_port, server_port, b'',
-                                                     seq=our_seq_data, ack_num=new_ack, flags=0x10,
-                                                     ip_id=ip_id)
-                                ip_id = (ip_id + 1) & 0xFFFF
-                                try:
-                                    await data_out_send.send(bytes(pkt_payload))
-                                except trio.ClosedResourceError:
-                                    break
-                            elif isinstance(signal, tuple) and signal[0] == 'fin':
-                                _, fin_seq, fin_data_len, _ = signal
-                                new_ack = (fin_seq + fin_data_len + 1) & 0xFFFFFFFF
-                                await self._send_tcp(participant, tcp_src_port, server_port, b'',
-                                                     seq=our_seq_data, ack_num=new_ack, flags=0x10,
-                                                     ip_id=ip_id)
-                                ip_id = (ip_id + 1) & 0xFFFF
-                                _forward_out_ack(signal[-1])
+                            if isinstance(signal, tuple) and signal[0] == 'syn_ack':
+                                server_seq, server_port = signal[1], signal[2]
+                                server_ack = (server_seq + 1) & 0xFFFFFFFF
                                 break
                             elif signal == 'cancel':
-                                break
+                                logger.info("TCP handshake cancelled for %s", participant.mac_address)
+                                return
+                        await self._send_tcp(participant, tcp_src_port, server_port, b'',
+                                             seq=(tcp_isn + 1) & 0xFFFFFFFF,
+                                             ack_num=(server_seq + 1) & 0xFFFFFFFF,
+                                             flags=0x10, ip_id=ip_id)
+                        ip_id = (ip_id + 1) & 0xFFFF
+                        logger.info("TCP handshake complete with %s", participant.mac_address)
+                        if out_conn_idx == 0:
+                            await self._interface.set_broadcom_state(1)
 
-                    async with trio.open_nursery() as _kn:
-                        if self._enable_qos_keepalive:
-                            _kn.start_soon(_qos_keepalive)
-                        _kn.start_soon(_outgoing_ack_task)
-                        try:
+                        our_seq_data = (tcp_isn + 1) & 0xFFFFFFFF
+                        initial_our_seq = our_seq_data
+
+                        async def _outgoing_send_fn(data: bytes, push: bool = True) -> None:
+                            nonlocal our_seq_data, ip_id
+                            await self._send_tcp(participant, tcp_src_port, server_port, data,
+                                                 seq=our_seq_data, ack_num=server_ack,
+                                                 flags=0x18 if push else 0x10, ip_id=ip_id)
+                            ip_id = (ip_id + 1) & 0xFFFF
+                            our_seq_data = (our_seq_data + len(data)) & 0xFFFFFFFF
+
+                        async def _outgoing_retransmit_fn(byte_offset: int, data: bytes, push: bool) -> None:
+                            nonlocal ip_id
+                            seq = (initial_our_seq + byte_offset) & 0xFFFFFFFF
+                            await self._send_tcp(participant, tcp_src_port, server_port, data,
+                                                 seq=seq, ack_num=server_ack,
+                                                 flags=0x18 if push else 0x10, ip_id=ip_id)
+                            ip_id = (ip_id + 1) & 0xFFFF
+
+                        def _forward_out_ack(remote_ack_num: int) -> None:
+                            rel = (remote_ack_num - initial_our_seq) & 0xFFFFFFFF
+                            try:
+                                ack_send.send_nowait(rel)
+                            except (trio.WouldBlock, trio.ClosedResourceError):
+                                pass
+
+                        # Incoming TCP handshake: their 49*** → our 5002
+                        logger.info("Waiting for incoming TCP SYN from %s", participant.mac_address)
+                        while True:
+                            signal = await in_recv.receive()
+                            if isinstance(signal, tuple) and signal[0] == 'syn':
+                                client_seq, client_src_port = signal[1], signal[2]
+                                break
+                            elif signal == 'cancel':
+                                logger.info("TCP handshake cancelled for %s", participant.mac_address)
+                                return
+                        await self._send_tcp(participant, 5002, client_src_port, b'',
+                                             seq=in_isn,
+                                             ack_num=(client_seq + 1) & 0xFFFFFFFF,
+                                             flags=0x12, ip_id=ip_id)
+                        ip_id = (ip_id + 1) & 0xFFFF
+                        while True:
+                            signal = await in_recv.receive()
+                            if isinstance(signal, tuple) and signal[0] == 'ack':
+                                break
+                            elif signal == 'cancel':
+                                logger.info("TCP handshake cancelled for %s", participant.mac_address)
+                                return
+                        logger.info("Incoming TCP handshake complete with %s", participant.mac_address)
+
+                        initial_in_our_seq = in_our_seq
+                        ooo: list[tuple[int, bytes]] = []
+                        expected_seq = (client_seq + 1) & 0xFFFFFFFF
+
+                        async def _incoming_send_fn(data: bytes, push: bool = True) -> None:
+                            nonlocal in_our_seq, ip_id
+                            await self._send_tcp(participant, 5002, client_src_port, data,
+                                                 seq=in_our_seq, ack_num=expected_seq,
+                                                 flags=0x18 if push else 0x10, ip_id=ip_id)
+                            ip_id = (ip_id + 1) & 0xFFFF
+                            in_our_seq = (in_our_seq + len(data)) & 0xFFFFFFFF
+
+                        async def _incoming_retransmit_fn(byte_offset: int, data: bytes, push: bool) -> None:
+                            nonlocal ip_id
+                            seq = (initial_in_our_seq + byte_offset) & 0xFFFFFFFF
+                            await self._send_tcp(participant, 5002, client_src_port, data,
+                                                 seq=seq, ack_num=expected_seq,
+                                                 flags=0x18 if push else 0x10, ip_id=ip_id)
+                            ip_id = (ip_id + 1) & 0xFFFF
+
+                        def _forward_in_ack(remote_ack_num: int) -> None:
+                            rel = (remote_ack_num - initial_in_our_seq) & 0xFFFFFFFF
+                            try:
+                                in_ack_send.send_nowait(rel)
+                            except (trio.WouldBlock, trio.ClosedResourceError):
+                                pass
+
+                        await self._events.put(TCPStreamEvent(
+                            participant,
+                            send_stream=TCPStream(data_out_recv, _outgoing_send_fn, ack_recv, _outgoing_retransmit_fn),
+                            recv_stream=TCPStream(data_in_recv, _incoming_send_fn, in_ack_recv, _incoming_retransmit_fn)))
+
+                        async def _deliver(payload: bytes) -> None:
+                            nonlocal expected_seq
+                            expected_seq = (expected_seq + len(payload)) & 0xFFFFFFFF
+                            await data_in_send.send(bytes(payload))
+
+                        async def _drain_ooo() -> None:
+                            ooo.sort(key=lambda x: x[0])
+                            while ooo and ooo[0][0] == expected_seq:
+                                await _deliver(ooo.pop(0)[1])
+
+                        def _seq_lt(a: int, b: int) -> bool:
+                            return ((b - a) & 0xFFFFFFFF) < 0x80000000
+
+                        logger.info("Streaming TCP data from %s", participant.mac_address)
+                        _keepalive_scope = trio.CancelScope()
+
+                        async def _qos_keepalive() -> None:
+                            with _keepalive_scope:
+                                while True:
+                                    await trio.sleep(10)
+                                    await self._send_qos_null(participant)
+
+                        async def _outgoing_ack_task() -> None:
+                            nonlocal ip_id
+                            while True:
+                                signal = await tcp_recv.receive()
+                                if isinstance(signal, tuple) and signal[0] == 'ack':
+                                    _, remote_ack = signal
+                                    _forward_out_ack(remote_ack)
+                                elif isinstance(signal, tuple) and signal[0] == 'data':
+                                    _, pkt_seq, pkt_payload, _psh, remote_ack = signal
+                                    _forward_out_ack(remote_ack)
+                                    new_ack = (pkt_seq + len(pkt_payload)) & 0xFFFFFFFF
+                                    await self._send_tcp(participant, tcp_src_port, server_port, b'',
+                                                         seq=our_seq_data, ack_num=new_ack, flags=0x10,
+                                                         ip_id=ip_id)
+                                    ip_id = (ip_id + 1) & 0xFFFF
+                                    try:
+                                        await data_out_send.send(bytes(pkt_payload))
+                                    except trio.ClosedResourceError:
+                                        break
+                                elif isinstance(signal, tuple) and signal[0] == 'fin':
+                                    _, fin_seq, fin_data_len, _ = signal
+                                    new_ack = (fin_seq + fin_data_len + 1) & 0xFFFFFFFF
+                                    await self._send_tcp(participant, tcp_src_port, server_port, b'',
+                                                         seq=our_seq_data, ack_num=new_ack, flags=0x10,
+                                                         ip_id=ip_id)
+                                    ip_id = (ip_id + 1) & 0xFFFF
+                                    await self._send_tcp(participant, tcp_src_port, server_port, b'',
+                                                         seq=our_seq_data, ack_num=new_ack, flags=0x11,
+                                                         ip_id=ip_id)
+                                    ip_id = (ip_id + 1) & 0xFFFF
+                                    _forward_out_ack(signal[-1])
+                                    break
+                                elif signal == 'cancel':
+                                    break
+
+                        async with trio.open_nursery() as _kn:
+                            if self._enable_qos_keepalive:
+                                _kn.start_soon(_qos_keepalive)
+                            _kn.start_soon(_outgoing_ack_task)
                             while True:
                                 signal = await in_recv.receive()
                                 if isinstance(signal, tuple) and signal[0] == 'data':
@@ -2239,26 +2245,30 @@ class APNetwork:
                                                          seq=in_our_seq, ack_num=new_ack, flags=0x10,
                                                          ip_id=ip_id)
                                     ip_id = (ip_id + 1) & 0xFFFF
+                                    await self._send_tcp(participant, 5002, client_src_port, b'',
+                                                         seq=in_our_seq, ack_num=new_ack, flags=0x11,
+                                                         ip_id=ip_id)
+                                    ip_id = (ip_id + 1) & 0xFFFF
                                     _keepalive_scope.cancel()
                                     break
                                 elif signal == 'cancel':
                                     logger.info("TCP data loop cancelled for %s", participant.mac_address)
                                     _keepalive_scope.cancel()
                                     return
-                        finally:
-                            await data_out_send.aclose()
-                            await data_in_send.aclose()
-                            await ack_send.aclose()
-                            await in_ack_send.aclose()
-                finally:
-                    self._tcp_channels.get(participant.mac_address, {}).pop(5002, None)
-                    await in_send.aclose()
-                    await in_recv.aclose()
+
+                        # Connection pair complete — advance to next port index and fresh ISN
+                        out_conn_idx += 1
+                        in_isn = random.randint(0, 0xFFFFFFFF)
+                    finally:
+                        self._tcp_channels.get(participant.mac_address, {}).pop(tcp_src_port, None)
+                        await tcp_send.aclose()
+                        await tcp_recv.aclose()
+                        await data_out_send.aclose()
+                        await data_in_send.aclose()
+                        await ack_send.aclose()
+                        await in_ack_send.aclose()
             finally:
-                self._tcp_channels.get(participant.mac_address, {}).pop(tcp_src_port, None)
                 self._tcp_channels.get(participant.mac_address, {}).pop(5002, None)
-                await tcp_send.aclose()
-                await tcp_recv.aclose()
                 await in_send.aclose()
                 await in_recv.aclose()
         finally:
