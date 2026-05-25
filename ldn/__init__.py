@@ -1117,7 +1117,8 @@ class CreateNetworkParam:
         field(default_factory=lambda: random.randint(0, 0xFFFFFFFFFFFFFFFF))
 
     protocol: int = 1
-    
+    enable_qos_keepalive: bool = False
+
     keys: dict[str, bytes] = field(default_factory=dict)
     dev: bool = False
 
@@ -1601,6 +1602,7 @@ class APNetwork:
         
         self._accept_filter = param.accept_filter
         self._enable_challenge = param.enable_challenge
+        self._enable_qos_keepalive = param.enable_qos_keepalive
         self._device_id = param.device_id
         self._platform = param.platform
         
@@ -2161,7 +2163,8 @@ class APNetwork:
                                 break
 
                     async with trio.open_nursery() as _kn:
-                        _kn.start_soon(_qos_keepalive)
+                        if self._enable_qos_keepalive:
+                            _kn.start_soon(_qos_keepalive)
                         _kn.start_soon(_outgoing_ack_task)
                         try:
                             while True:
